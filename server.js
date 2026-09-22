@@ -87,10 +87,10 @@ function runFfmpeg(args) {
       settled = true;
       resolve({ code: null, stderrTail: stderrTail, spawnError: err });
     });
-    proc.on('close', function (code) {
+    proc.on('close', function (code, signal) {
       if (settled) return;
       settled = true;
-      resolve({ code: code, stderrTail: stderrTail });
+      resolve({ code: code, signal: signal, stderrTail: stderrTail });
     });
   });
   return { promise: promise, kill: function () { try { proc.kill('SIGKILL'); } catch (e) {} } };
@@ -125,10 +125,20 @@ app.post('/render', function (req, res, next) {
   }
 
   var outputPath = path.join(os.tmpdir(), (req.jobId || crypto.randomUUID()) + '-output.mp4');
+  // "format=auto" no overlay deixa o ffmpeg escolher o pixel format --
+  // como o overlay tem alpha, ele quase sempre escolhe yuv444p (3 planos em
+  // resolucao cheia) em vez do yuv420p padrao. Isso, combinado com o
+  // ffmpeg detectando dezenas de "cpus" dentro do container (mas so tendo
+  // a memoria de uma instancia pequena de verdade), faz o libx264 abrir
+  // threads e buffers demais e o processo morre (OOM/kill do container --
+  // Node ve so "code: null", sem mensagem de erro nenhuma). Forcamos
+  // yuv420p (padrao pra Reels/Stories de qualquer forma) e limitamos as
+  // threads do encoder pra manter o uso de memoria previsivel.
   var filter =
     '[0:v]scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,' +
     'crop=' + W + ':' + H + ',setsar=1[bg];' +
-    '[bg][1:v]overlay=0:0:format=auto[outv]';
+    '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[outv]';
+  var ENCODE_THREADS = process.env.FFMPEG_THREADS || '2';
 
   var withAudioArgs = [
     '-y',
@@ -136,7 +146,7 @@ app.post('/render', function (req, res, next) {
     '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]', '-map', '0:a?',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
     '-c:a', 'aac', '-movflags', '+faststart',
     outputPath,
   ];
@@ -151,7 +161,7 @@ app.post('/render', function (req, res, next) {
     '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
     '-an', '-movflags', '+faststart',
     outputPath,
   ];
@@ -161,11 +171,11 @@ app.post('/render', function (req, res, next) {
     var result = await runFfmpegWithTimeout(withAudioArgs, 5 * 60 * 1000);
 
     if (result.code !== 0 && !result.timedOut) {
-      console.error('[render] 1a tentativa (com audio) falhou, codigo', result.code, result.stderrTail);
+      console.error('[render] 1a tentativa (com audio) falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       await fsp.unlink(outputPath).catch(function () {});
       result = await runFfmpegWithTimeout(noAudioArgs, 5 * 60 * 1000);
       if (result.code !== 0 && !result.timedOut) {
-        console.error('[render] 2a tentativa (sem audio) tambem falhou, codigo', result.code, result.stderrTail);
+        console.error('[render] 2a tentativa (sem audio) tambem falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       }
     }
 
