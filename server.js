@@ -27,7 +27,8 @@ const ENCODE_THREADS = process.env.FFMPEG_THREADS || '2';
 const GEMINI_API_BASE = process.env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com';
 const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-3.8-flash';
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
-const GEMINI_IMAGE_SIZE = process.env.GEMINI_IMAGE_SIZE || '4K';
+// 2K: a peça final sai em 1080px, então 4K era desperdício (custa ~50% a mais)
+const GEMINI_IMAGE_SIZE = process.env.GEMINI_IMAGE_SIZE || '2K';
 // preço por 1M tokens do modelo de texto/vídeo (só pra mostrar custo estimado)
 const PRICE_IN_PER_M = Number(process.env.GEMINI_PRICE_IN_PER_M || 0.75);
 const PRICE_OUT_PER_M = Number(process.env.GEMINI_PRICE_OUT_PER_M || 3.75);
@@ -61,7 +62,7 @@ app.use(cors({
   origin: function (origin, cb) {
     cb(null, isOriginAllowed(origin));
   },
-  exposedHeaders: ['X-Autoedit-Plan'],
+  exposedHeaders: ['X-Autoedit-Plan', 'X-Autoedit-Id'],
 }));
 
 // Endpoints que gastam crédito do Gemini só aceitam chamadas vindas do site
@@ -105,6 +106,277 @@ const smartEditLimiter = makeRateLimiter('smart', Number(process.env.SMART_PER_I
 // servidor se vários renders caírem ao mesmo tempo.
 const MAX_CONCURRENT = 2;
 let activeJobs = 0;
+
+// A vaga de processamento (ffmpeg) é reservada DEPOIS do upload, num passo
+// só (checar e ocupar acontecem juntos, sem brecha de corrida). Upload lento
+// em 4G não prende vaga. Se as vagas estiverem ocupadas, espera até 3 min
+// em vez de recusar na hora. A vaga volta quando a resposta termina, de
+// qualquer jeito (sucesso, erro, ou o cliente fechou a página).
+function uploadedFiles(req) {
+  var out = [];
+  if (req.file) out.push(req.file);
+  if (Array.isArray(req.files)) out = out.concat(req.files);
+  else if (req.files) Object.keys(req.files).forEach(function (k) { out = out.concat(req.files[k]); });
+  return out;
+}
+function waitSlot(req, res, next) {
+  var t0 = Date.now();
+  var gone = false;
+  res.on('close', function () { if (!res.writableEnded) gone = true; });
+  (function tryTake() {
+    if (gone) { cleanupFiles(uploadedFiles(req)); return; }
+    if (activeJobs < MAX_CONCURRENT) {
+      activeJobs++;
+      req._slot = true;
+      req._releaseSlot = function () { if (req._slot) { req._slot = false; activeJobs--; } };
+      res.on('finish', req._releaseSlot);
+      res.on('close', req._releaseSlot);
+      return next();
+    }
+    if (Date.now() - t0 > 3 * 60 * 1000) {
+      cleanupFiles(uploadedFiles(req));
+      return res.status(503).json({ error: 'Servidor ocupado, tenta de novo em alguns segundos.' });
+    }
+    setTimeout(tryTake, 400);
+  })();
+}
+// Durante a espera da IA (rede, não CPU) a vaga fica livre pra outro render.
+function pauseSlot(req) {
+  if (req._slot) { req._slot = false; activeJobs--; }
+}
+async function resumeSlot(req, maxWaitMs) {
+  var t0 = Date.now();
+  while (activeJobs >= MAX_CONCURRENT) {
+    if (Date.now() - t0 > maxWaitMs) return false;
+    await new Promise(function (r) { setTimeout(r, 400); });
+  }
+  activeJobs++;
+  req._slot = true;
+  return true;
+}
+
+// ---------------------- métricas de uso (anônimas) ----------------------
+// Eventos do site + um registro por trabalho do servidor, em JSON Lines.
+// Pra sobreviver aos deploys, precisa de um Volume no Railway (o Railway
+// informa o caminho em RAILWAY_VOLUME_MOUNT_PATH). Sem volume, os dados
+// ficam no /tmp e somem a cada deploy — o painel avisa.
+const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || os.tmpdir();
+const DATA_PERSISTENT = !!(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH);
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+const EVENTS_FILE = path.join(DATA_DIR, 'studio-eventos.jsonl');
+var eventsChecked = 0;
+function appendEvent(obj) {
+  // guarda no máximo ~40MB; o mais antigo vai pra .1 (e o .1 anterior some)
+  if (++eventsChecked % 500 === 0) {
+    try { if (fs.statSync(EVENTS_FILE).size > 40 * 1024 * 1024) fs.renameSync(EVENTS_FILE, EVENTS_FILE + '.1'); } catch (e) {}
+  }
+  fs.appendFile(EVENTS_FILE, JSON.stringify(obj) + '\n', function (err) {
+    if (err) console.error('[metricas] não consegui gravar evento:', err.message);
+  });
+}
+function logJob(data) {
+  var e = Object.assign({ t: new Date().toISOString(), tipo: 'job' }, data);
+  console.log('[job]', JSON.stringify(e));
+  appendEvent(e);
+}
+
+// ---------------------- eventos do site + painel ----------------------
+// O site manda eventos anônimos (um id aleatório por aparelho, sem nome,
+// e-mail ou dado do imóvel). O painel em /painel?token=... junta tudo.
+const EVENTOS_OK = new Set([
+  'app_aberto', 'aba', 'midia', 'melhorar_foto', 'montagem', 'remontagem', 'ouvir_previa', 'locucao',
+  'validacao_bloqueou', 'conferencia', 'gerar', 'pronto_salvar', 'pronto_compartilhar', 'pronto_fechar',
+  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro',
+]);
+const eventsLimiter = makeRateLimiter('events', Number(process.env.EVENTS_PER_IP_HOUR || 600), Number(process.env.EVENTS_PER_DAY || 50000));
+function cleanProps(p) {
+  var out = {};
+  if (!p || typeof p !== 'object') return out;
+  Object.keys(p).slice(0, 12).forEach(function (k) {
+    var key = String(k).replace(/[^a-zA-Z0-9_]/g, '').slice(0, 24);
+    var v = p[k];
+    if (typeof v === 'number' && isFinite(v)) out[key] = Math.round(v * 100) / 100;
+    else if (typeof v === 'boolean') out[key] = v;
+    else if (typeof v === 'string') out[key] = v.slice(0, 60);
+  });
+  return out;
+}
+app.post('/events', requireSiteOrigin, eventsLimiter, express.text({ type: '*/*', limit: '32kb' }), function (req, res) {
+  var body;
+  try { body = JSON.parse(req.body || '{}'); } catch (e) { return res.status(400).end(); }
+  var d = String(body.d || '').replace(/[^a-z0-9-]/gi, '').slice(0, 40);
+  var sid = String(body.s || '').replace(/[^a-z0-9-]/gi, '').slice(0, 40);
+  var dev = body.dev === 'mobile' ? 'mobile' : 'desktop';
+  var evs = Array.isArray(body.ev) ? body.ev.slice(0, 40) : [];
+  var now = new Date().toISOString();
+  evs.forEach(function (x) {
+    if (!x || !EVENTOS_OK.has(x.e)) return;
+    appendEvent({ t: now, tipo: 'ev', d: d, s: sid, dev: dev, e: x.e, p: cleanProps(x.p) });
+  });
+  res.status(204).end();
+});
+
+function tokenOk(given) {
+  var want = (process.env.ADMIN_TOKEN || '').trim();
+  if (!want || !given) return false;
+  var a = crypto.createHash('sha256').update(String(given)).digest();
+  var b = crypto.createHash('sha256').update(want).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function lerEventos(desdeMs) {
+  var out = [];
+  var txt = '';
+  try { txt = fs.readFileSync(EVENTS_FILE, 'utf8'); } catch (e) { return out; }
+  txt.split('\n').forEach(function (l) {
+    if (!l) return;
+    try { var o = JSON.parse(l); if (Date.parse(o.t) >= desdeMs) out.push(o); } catch (e) {}
+  });
+  return out;
+}
+
+function calcularMetricas(dias) {
+  var desde = Date.now() - dias * 86400000;
+  var todos = lerEventos(desde);
+  var evs = todos.filter(function (o) { return o.tipo === 'ev'; });
+  var jobs = todos.filter(function (o) { return o.tipo === 'job'; });
+  var dia = function (t) { return String(t).slice(0, 10); };
+  var aparelhos = new Set(), aparelhos7 = new Set(), sessoes = {};
+  var porDia = {};
+  var d7 = Date.now() - 7 * 86400000;
+  evs.forEach(function (o) {
+    if (o.d) { aparelhos.add(o.d); if (Date.parse(o.t) >= d7) aparelhos7.add(o.d); }
+    var s = sessoes[o.s] || (sessoes[o.s] = { dev: o.dev, evs: new Set(), gerou: {}, abas: new Set() });
+    s.evs.add(o.e);
+    if (o.e === 'aba' && o.p && o.p.aba) s.abas.add(o.p.aba);
+    var pd = porDia[dia(o.t)] || (porDia[dia(o.t)] = { aparelhos: new Set(), pecas: 0, fotoIA: 0, montagens: 0 });
+    if (o.d) pd.aparelhos.add(o.d);
+    if (o.e === 'gerar' && o.p && o.p.ok) pd.pecas++;
+  });
+  jobs.forEach(function (j) {
+    var pd = porDia[dia(j.t)] || (porDia[dia(j.t)] = { aparelhos: new Set(), pecas: 0, fotoIA: 0, montagens: 0 });
+    if (j.endpoint === 'foto' && j.ok) pd.fotoIA++;
+    if (j.endpoint === 'montagem' && j.ok) pd.montagens++;
+  });
+  var listaSessoes = Object.keys(sessoes).map(function (k) { return sessoes[k]; });
+  function conta(fn) { return listaSessoes.filter(fn).length; }
+  var funil = [
+    ['Abriram o Studio', conta(function (s) { return s.evs.has('app_aberto'); })],
+    ['Escolheram foto ou vídeo', conta(function (s) { return s.evs.has('midia'); })],
+    ['Geraram uma peça', conta(function (s) { return s.evs.has('gerar'); })],
+    ['Salvaram ou enviaram', conta(function (s) { return s.evs.has('pronto_salvar') || s.evs.has('pronto_compartilhar'); })],
+  ];
+  function contaEv(nome, filtro) { return evs.filter(function (o) { return o.e === nome && (!filtro || filtro(o.p || {})); }).length; }
+  var gerar = { foto: contaEv('gerar', function (p) { return p.tipo === 'foto' && p.ok; }), video: contaEv('gerar', function (p) { return p.tipo === 'video' && p.ok; }), montagem: contaEv('gerar', function (p) { return p.tipo === 'montagem' && p.ok; }), falhas: contaEv('gerar', function (p) { return !p.ok; }) };
+  function jobStats(ep) {
+    var js = jobs.filter(function (j) { return j.endpoint === ep; });
+    var ok = js.filter(function (j) { return j.ok; });
+    var ms = ok.map(function (j) { return j.ms || 0; }).sort(function (a, b) { return a - b; });
+    var custo = ok.reduce(function (s, j) { return s + (j.custoUSD || 0); }, 0);
+    return { total: js.length, ok: ok.length, falhas: js.length - ok.length, medianaSeg: ms.length ? Math.round(ms[Math.floor(ms.length / 2)] / 100) / 10 : 0, custoUSD: Math.round(custo * 100) / 100 };
+  }
+  var erros = {};
+  jobs.filter(function (j) { return !j.ok && j.erro; }).forEach(function (j) { var k = j.endpoint + ': ' + j.erro; erros[k] = (erros[k] || 0) + 1; });
+  evs.filter(function (o) { return o.e === 'erro'; }).forEach(function (o) { var k = 'site: ' + ((o.p && o.p.onde) || '?') + ' · ' + ((o.p && o.p.msg) || ''); erros[k] = (erros[k] || 0) + 1; });
+  var dias_ = Object.keys(porDia).sort().map(function (k) { var v = porDia[k]; return { dia: k, aparelhos: v.aparelhos.size, pecas: v.pecas, fotoIA: v.fotoIA, montagens: v.montagens }; });
+  var anuncios = {};
+  evs.filter(function (o) { return o.e === 'gerar' && o.p && o.p.ok && o.p.anuncio; }).forEach(function (o) { anuncios[o.p.anuncio] = (anuncios[o.p.anuncio] || 0) + 1; });
+  return {
+    dias: dias, persistente: DATA_PERSISTENT,
+    aparelhos: aparelhos.size, aparelhos7: aparelhos7.size, sessoes: listaSessoes.length,
+    celular: conta(function (s) { return s.dev === 'mobile'; }), computador: conta(function (s) { return s.dev !== 'mobile'; }),
+    funil: funil, gerar: gerar,
+    foto: jobStats('foto'), montagem: jobStats('montagem'), remontar: jobStats('remontar'), render: jobStats('render'),
+    comLocucao: jobs.filter(function (j) { return j.endpoint === 'montagem' && j.ok && j.comVoz; }).length,
+    validacaoBloqueou: contaEv('validacao_bloqueou'), conferenciaCorrigir: contaEv('conferencia', function (p) { return p.acao === 'corrigir'; }),
+    rascunhos: contaEv('rascunho_restaurado'), ouvirPrevia: contaEv('ouvir_previa'),
+    anuncios: anuncios,
+    erros: Object.keys(erros).map(function (k) { return [k, erros[k]]; }).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 12),
+    porDia: dias_,
+  };
+}
+
+function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+app.get('/painel', function (req, res) {
+  if (!(process.env.ADMIN_TOKEN || '').trim()) return res.status(503).type('text/plain').send('Painel desligado: defina a variável ADMIN_TOKEN no Railway.');
+  if (!tokenOk(req.query.token)) return res.status(401).type('text/plain').send('Acesso negado.');
+  var dias = Math.min(180, Math.max(1, Number(req.query.dias) || 30));
+  var m = calcularMetricas(dias);
+  if (req.query.formato === 'json') return res.json(m);
+  var usd = function (v) { return 'US$ ' + v.toFixed(2).replace('.', ','); };
+  var maxF = Math.max(1, m.funil[0][1]);
+  var custoTotal = m.foto.custoUSD + m.montagem.custoUSD;
+  var pecasTotal = m.gerar.foto + m.gerar.video + m.gerar.montagem;
+  var html = '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Painel · Studio Giovani</title><style>' +
+    ':root{--bg:#F5F3EE;--s:#fff;--i:#1C1B18;--m:#5E584C;--l:#DDD5C4;--g:#C9A24D;--r:#C12A2A}@media(prefers-color-scheme:dark){:root{--bg:#141517;--s:#1D1D1B;--i:#F1EFE9;--m:#B3AC9C;--l:#39352C;--g:#D8B15C;--r:#F08A7A}}' +
+    'body{margin:0;background:var(--bg);color:var(--i);font:15px/1.5 system-ui,-apple-system,sans-serif}.w{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{font:600 28px Georgia,serif;margin:0 0 4px}h2{font:600 19px Georgia,serif;margin:28px 0 10px}.mut{color:var(--m)}' +
+    '.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.c{background:var(--s);border:1px solid var(--l);border-radius:12px;padding:14px}.n{font:600 30px Georgia,serif;font-variant-numeric:tabular-nums}.l{font-size:13px;color:var(--m)}' +
+    '.bar{display:grid;grid-template-columns:200px 1fr 60px;gap:10px;align-items:center;margin:6px 0}.bar div.t{height:14px;border-radius:7px;background:var(--g)}.tw{overflow-x:auto;background:var(--s);border:1px solid var(--l);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:480px;font-variant-numeric:tabular-nums}td,th{padding:8px 12px;border-bottom:1px solid var(--l);text-align:left}th{font-size:12px;color:var(--m);text-transform:uppercase}.av{background:#FBF0D9;color:#6b4700;padding:10px 14px;border-radius:10px;margin:14px 0}' +
+    '@media(max-width:560px){.bar{grid-template-columns:1fr 50px}.bar span.lb{grid-column:1/-1}}</style></head><body><div class="w">' +
+    '<h1>Painel do Studio Giovani</h1><div class="mut">Últimos ' + dias + ' dias · <a href="?token=' + esc(req.query.token) + '&dias=7">7 dias</a> · <a href="?token=' + esc(req.query.token) + '&dias=30">30 dias</a> · <a href="?token=' + esc(req.query.token) + '&dias=90">90 dias</a></div>' +
+    (m.persistente ? '' : '<div class="av"><b>Atenção:</b> sem Volume no Railway, estes dados zeram a cada publicação do servidor.</div>') +
+    '<div class="g" style="margin-top:16px">' +
+    '<div class="c"><div class="n">' + m.aparelhos + '</div><div class="l">aparelhos diferentes (' + m.aparelhos7 + ' nos últimos 7 dias)</div></div>' +
+    '<div class="c"><div class="n">' + m.sessoes + '</div><div class="l">sessões · ' + m.celular + ' no celular, ' + m.computador + ' no computador</div></div>' +
+    '<div class="c"><div class="n">' + pecasTotal + '</div><div class="l">peças geradas · ' + m.gerar.foto + ' fotos, ' + m.gerar.video + ' vídeos, ' + m.gerar.montagem + ' montagens</div></div>' +
+    '<div class="c"><div class="n">' + usd(custoTotal) + '</div><div class="l">gasto com IA · ' + (pecasTotal ? usd(custoTotal / pecasTotal) + ' por peça' : '—') + '</div></div>' +
+    '</div><h2>Funil</h2><div class="c">' +
+    m.funil.map(function (f) { return '<div class="bar"><span class="lb">' + esc(f[0]) + '</span><div class="t" style="width:' + Math.max(2, Math.round(100 * f[1] / maxF)) + '%"></div><b>' + f[1] + '</b></div>'; }).join('') +
+    '</div><h2>IA e processamento</h2><div class="tw"><table><tr><th></th><th>Pedidos</th><th>Com sucesso</th><th>Falhas</th><th>Tempo (mediana)</th><th>Custo</th></tr>' +
+    [['Melhorar foto', m.foto], ['Montagem automática', m.montagem], ['Ajuste manual da montagem', m.remontar], ['Vídeo final (arte)', m.render]].map(function (r) {
+      var j = r[1]; return '<tr><td>' + r[0] + '</td><td>' + j.total + '</td><td>' + j.ok + '</td><td>' + j.falhas + '</td><td>' + (j.medianaSeg ? j.medianaSeg + ' s' : '—') + '</td><td>' + (j.custoUSD ? usd(j.custoUSD) : '—') + '</td></tr>';
+    }).join('') + '</table></div>' +
+    '<p class="mut">' + m.comLocucao + ' montagens com locução · "Ouvir a prévia" usado ' + m.ouvirPrevia + ' vezes · ' + m.validacaoBloqueou + ' vezes o site pediu bairro/valor antes de gerar · ' + m.conferenciaCorrigir + ' vezes o corretor voltou pra corrigir na conferência · ' + m.rascunhos + ' rascunhos retomados.</p>' +
+    '<h2>Tipo de anúncio das peças</h2><div class="c">' + (Object.keys(m.anuncios).length ? Object.keys(m.anuncios).map(function (k) { return esc(k) + ': <b>' + m.anuncios[k] + '</b>'; }).join(' · ') : '<span class="mut">ainda sem dados</span>') + '</div>' +
+    '<h2>Por dia</h2><div class="tw"><table><tr><th>Dia</th><th>Aparelhos</th><th>Peças</th><th>Fotos com IA</th><th>Montagens</th></tr>' +
+    m.porDia.slice().reverse().map(function (d) { return '<tr><td>' + d.dia.split('-').reverse().join('/') + '</td><td>' + d.aparelhos + '</td><td>' + d.pecas + '</td><td>' + d.fotoIA + '</td><td>' + d.montagens + '</td></tr>'; }).join('') +
+    '</table></div><h2>Erros mais comuns</h2><div class="c">' + (m.erros.length ? m.erros.map(function (e) { return esc(e[0]) + ' — <b>' + e[1] + '</b>'; }).join('<br>') : '<span class="mut">nenhum erro registrado</span>') + '</div>' +
+    '<p class="mut" style="margin-top:28px">Dados anônimos: um código aleatório por aparelho, sem nome, telefone ou dados do imóvel. <a href="?token=' + esc(req.query.token) + '&dias=' + dias + '&formato=json">Baixar em JSON</a></p></div></body></html>';
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('html').send(html);
+});
+
+// ---------------------- montagens guardadas no servidor ----------------------
+// Depois da montagem com IA, os clipes originais, a locução tratada e o
+// vídeo montado ficam aqui por 1 hora. Assim:
+//  - "Gerar vídeo final" aplica a arte direto aqui (o vídeo não precisa
+//    descer pro celular e subir de novo);
+//  - o corretor pode ajustar a montagem na mão sem reenviar os clipes.
+const MONTAGENS = new Map();
+const MONTAGEM_TTL = 60 * 60 * 1000;
+const MAX_MONTAGENS = 6;
+function montagemFiles(m) {
+  return m.clips.map(function (c) { return c.path; })
+    .concat(m.voice ? [m.voice.cleanPath] : [], m.montagemPath ? [m.montagemPath] : []);
+}
+function dropMontagem(id) {
+  var m = MONTAGENS.get(id);
+  if (!m) return;
+  MONTAGENS.delete(id);
+  cleanupPaths(montagemFiles(m));
+}
+function storeMontagem(id, m) {
+  m.usadoEm = Date.now();
+  MONTAGENS.set(id, m);
+  if (MONTAGENS.size > MAX_MONTAGENS) {
+    var oldest = null;
+    MONTAGENS.forEach(function (v, k) { if (!oldest || v.usadoEm < MONTAGENS.get(oldest).usadoEm) oldest = k; });
+    if (oldest && oldest !== id) dropMontagem(oldest);
+  }
+}
+function getMontagem(id) {
+  if (!/^[0-9a-f-]{36}$/.test(String(id || ''))) return null;
+  var m = MONTAGENS.get(id);
+  if (!m) return null;
+  if (Date.now() - m.usadoEm > MONTAGEM_TTL) { dropMontagem(id); return null; }
+  m.usadoEm = Date.now();
+  return m;
+}
+setInterval(function () {
+  MONTAGENS.forEach(function (m, id) { if (Date.now() - m.usadoEm > MONTAGEM_TTL) dropMontagem(id); });
+}, 5 * 60 * 1000);
+const MONTAGEM_EXPIRADA = 'A montagem guardada no servidor expirou (fica 1 hora). Toque em "Montar vídeo com IA" de novo.';
 // Chamadas de IA de foto quase não usam CPU (é espera de rede), então têm
 // um limite separado.
 const MAX_AI_CONCURRENT = 4;
@@ -151,6 +423,8 @@ app.get('/health', function (req, res) {
   res.status(200).json({
     ok: true,
     ia: { chaveConfigurada: !!geminiKey(), modeloEdicao: GEMINI_TEXT_MODEL, modeloFoto: GEMINI_IMAGE_MODEL, tamanhoFoto: GEMINI_IMAGE_SIZE },
+    metricas: { persistentes: DATA_PERSISTENT },
+    montagensGuardadas: MONTAGENS.size,
   });
 });
 
@@ -158,7 +432,7 @@ app.get('/health', function (req, res) {
 
 // Roda um binário (ffmpeg/ffprobe) e resolve quando termina (nunca rejeita —
 // devolve sempre {code, stdout, stderrTail}, com code=null se nem iniciou).
-function runProcess(bin, args) {
+function runProcess(bin, args, onStderr) {
   var stderrTail = '';
   var stdout = '';
   var proc;
@@ -168,7 +442,11 @@ function runProcess(bin, args) {
     return { promise: Promise.resolve({ code: null, stdout: '', stderrTail: '', spawnError: err }), kill: function () {} };
   }
   proc.stdout.on('data', function (chunk) { stdout = (stdout + chunk.toString()).slice(-20000); });
-  proc.stderr.on('data', function (chunk) { stderrTail = (stderrTail + chunk.toString()).slice(-4000); });
+  proc.stderr.on('data', function (chunk) {
+    var txt = chunk.toString();
+    stderrTail = (stderrTail + txt).slice(-4000);
+    if (onStderr) { try { onStderr(txt); } catch (e) {} }
+  });
   var promise = new Promise(function (resolve) {
     var settled = false;
     proc.on('error', function (err) {
@@ -185,8 +463,8 @@ function runProcess(bin, args) {
   return { promise: promise, kill: function () { try { proc.kill('SIGKILL'); } catch (e) {} } };
 }
 
-function runWithTimeout(bin, args, timeoutMs) {
-  var run = runProcess(bin, args);
+function runWithTimeout(bin, args, timeoutMs, onStderr) {
+  var run = runProcess(bin, args, onStderr);
   var timedOut = false;
   var timer = setTimeout(function () { timedOut = true; run.kill(); }, timeoutMs);
   return run.promise.then(function (result) {
@@ -196,9 +474,32 @@ function runWithTimeout(bin, args, timeoutMs) {
   });
 }
 
-function runFfmpegWithTimeout(args, timeoutMs) {
-  return runWithTimeout('ffmpeg', args, timeoutMs);
+function runFfmpegWithTimeout(args, timeoutMs, onStderr) {
+  return runWithTimeout('ffmpeg', args, timeoutMs, onStderr);
 }
+
+// Progresso real do /render: o site manda um "progressId" junto com o
+// upload e consulta GET /render/progresso/:id enquanto o ffmpeg trabalha.
+const RENDER_PROGRESS = new Map();
+function cleanProgressId(v) { return String(v || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40); }
+function setRenderProgress(id, fase, pct) {
+  if (!id) return;
+  RENDER_PROGRESS.set(id, { fase: fase, pct: Math.max(0, Math.min(1, pct || 0)), t: Date.now() });
+}
+function ffmpegProgressWatcher(id, durationSec) {
+  if (!id || !durationSec) return null;
+  return function (txt) {
+    var m, last = null, re = /time=(\d+):(\d+):(\d+(?:\.\d+)?)/g;
+    while ((m = re.exec(txt))) last = m;
+    if (!last) return;
+    var sec = Number(last[1]) * 3600 + Number(last[2]) * 60 + Number(last[3]);
+    setRenderProgress(id, 'processando', sec / durationSec);
+  };
+}
+setInterval(function () {
+  var lim = Date.now() - 15 * 60 * 1000;
+  RENDER_PROGRESS.forEach(function (v, k) { if (v.t < lim) RENDER_PROGRESS.delete(k); });
+}, 60 * 1000).unref();
 
 // Duração do vídeo em segundos (ou null se não deu pra ler).
 async function probeDuration(filePath) {
@@ -327,6 +628,16 @@ async function prepareVoice(rawPath, jobId) {
   return { cleanPath: cleanPath, aiPath: aiPath, duracao: dur };
 }
 
+// Versão leve (540x960) só pra prévia no celular: ~5x menor que o original.
+async function makePreview(inputPath, outPath) {
+  var r = await runFfmpegWithTimeout(['-y', '-i', inputPath,
+    '-vf', 'scale=540:960,format=yuv420p',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '30',
+    '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', outPath], 2 * 60 * 1000);
+  if (r.code !== 0) console.error('[preview] falha, codigo', r.code, '| stderr:', r.stderrTail.slice(-500));
+  return r.code === 0;
+}
+
 function streamFileAndCleanup(res, filePath, contentType, downloadName, cleanup) {
   res.setHeader('Content-Type', contentType);
   res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
@@ -342,19 +653,30 @@ function streamFileAndCleanup(res, filePath, contentType, downloadName, cleanup)
 
 // ================================ /render ================================
 
-app.post('/render', function (req, res, next) {
-  if (activeJobs >= MAX_CONCURRENT) {
-    return res.status(503).json({ error: 'Servidor ocupado, tenta de novo em alguns segundos.' });
-  }
-  next();
-}, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'overlay', maxCount: 1 }]), async function (req, res) {
+app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'overlay', maxCount: 1 }]), waitSlot, async function (req, res) {
+  var t0 = Date.now();
   var videoFile = req.files && req.files.video && req.files.video[0];
   var overlayFile = req.files && req.files.overlay && req.files.overlay[0];
-
-  if (!videoFile || !overlayFile) {
-    await cleanupFiles([videoFile, overlayFile]);
-    return res.status(400).json({ error: 'Envie o campo "video" e o campo "overlay" (PNG).' });
+  // Montagem automática: o vídeo já está no servidor, só vem a arte (PNG).
+  var montagem = null;
+  if (!videoFile && req.body && req.body.montagemId) {
+    montagem = getMontagem(req.body.montagemId);
+    if (!montagem) {
+      await cleanupFiles([overlayFile]);
+      return res.status(410).json({ error: MONTAGEM_EXPIRADA });
+    }
   }
+
+  if ((!videoFile && !montagem) || !overlayFile) {
+    await cleanupFiles([videoFile, overlayFile]);
+    return res.status(400).json({ error: 'Envie o campo "video" (ou "montagemId") e o campo "overlay" (PNG).' });
+  }
+  var inputPath = videoFile ? videoFile.path : montagem.montagemPath;
+  var origem = videoFile ? 'upload' : 'montagem';
+  var progId = cleanProgressId(req.body && req.body.progressId);
+  setRenderProgress(progId, 'processando', 0);
+  var inputDur = progId ? await probeDuration(inputPath) : null;
+  var watch = ffmpegProgressWatcher(progId, inputDur);
 
   var outputPath = tempName(req.jobId || crypto.randomUUID(), 'output.mp4');
   // "format=auto" no overlay deixa o ffmpeg escolher o pixel format --
@@ -372,7 +694,7 @@ app.post('/render', function (req, res, next) {
     '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[outv]';
 
   var withAudioArgs = [
-    '-y', '-i', videoFile.path, '-i', overlayFile.path,
+    '-y', '-i', inputPath, '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]', '-map', '0:a?',
     '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
@@ -385,7 +707,7 @@ app.post('/render', function (req, res, next) {
   // devolver erro pro usuario, tentamos de novo sem audio: o Reels/Stories
   // deixa adicionar musica por cima depois de qualquer forma.
   var noAudioArgs = [
-    '-y', '-i', videoFile.path, '-i', overlayFile.path,
+    '-y', '-i', inputPath, '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]',
     '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
@@ -393,14 +715,14 @@ app.post('/render', function (req, res, next) {
     outputPath,
   ];
 
-  activeJobs++;
   try {
-    var result = await runFfmpegWithTimeout(withAudioArgs, 5 * 60 * 1000);
+    var result = await runFfmpegWithTimeout(withAudioArgs, 5 * 60 * 1000, watch);
 
     if (result.code !== 0 && !result.timedOut) {
       console.error('[render] 1a tentativa (com audio) falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       await fsp.unlink(outputPath).catch(function () {});
-      result = await runFfmpegWithTimeout(noAudioArgs, 5 * 60 * 1000);
+      setRenderProgress(progId, 'processando', 0);
+      result = await runFfmpegWithTimeout(noAudioArgs, 5 * 60 * 1000, watch);
       if (result.code !== 0 && !result.timedOut) {
         console.error('[render] 2a tentativa (sem audio) tambem falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       }
@@ -408,36 +730,49 @@ app.post('/render', function (req, res, next) {
 
     if (result.timedOut) {
       await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
+      logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'timeout', ms: Date.now() - t0 });
       if (!res.headersSent) res.status(504).json({ error: 'O processamento demorou demais e foi cancelado. Tenta com um vídeo menor.' });
       return;
     }
     if (result.code !== 0) {
       await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
+      logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'ffmpeg ' + result.code, ms: Date.now() - t0 });
       if (!res.headersSent) res.status(500).json({ error: 'Não deu pra gerar o vídeo. Tenta de novo, ou com outro arquivo.' });
       return;
     }
 
+    setRenderProgress(progId, 'enviando', 1);
+    logJob({ endpoint: 'render', origem: origem, ok: true, ms: Date.now() - t0, mb: videoFile ? Math.round(videoFile.size / 1048576) : 0 });
     streamFileAndCleanup(res, outputPath, 'video/mp4', 'giovani-video.mp4', function () {
       cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
     });
   } catch (err) {
     console.error('[render] erro inesperado:', err);
     await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
+    logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'inesperado', ms: Date.now() - t0 });
     if (!res.headersSent) res.status(500).json({ error: 'Não consegui processar o vídeo no servidor.' });
-  } finally {
-    activeJobs--;
   }
+});
+
+app.get('/render/progresso/:id', function (req, res) {
+  var p = RENDER_PROGRESS.get(cleanProgressId(req.params.id));
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(p ? { fase: p.fase, pct: Math.round(p.pct * 1000) / 1000 } : { fase: 'fila', pct: 0 });
+});
+
+// Baixar a montagem sem a arte, na qualidade original.
+app.get('/montagem/:id', requireSiteOrigin, function (req, res) {
+  var m = getMontagem(req.params.id);
+  if (!m) return res.status(410).json({ error: MONTAGEM_EXPIRADA });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="giovani-montagem.mp4"');
+  fs.createReadStream(m.montagemPath).on('error', function () { if (!res.headersSent) res.status(500).end(); }).pipe(res);
 });
 
 // ========================= /autoedit (manual) =========================
 // Recebe N clipes + os trechos (inicio/fim em segundos, na ORDEM FINAL do
 // vídeo — os clipes já vêm na ordem da montagem), corta e junta.
-app.post('/autoedit', function (req, res, next) {
-  if (activeJobs >= MAX_CONCURRENT) {
-    return res.status(503).json({ error: 'Servidor ocupado, tenta de novo em alguns segundos.' });
-  }
-  next();
-}, uploadClips.array('clips', 10), async function (req, res) {
+app.post('/autoedit', uploadClips.array('clips', 10), waitSlot, async function (req, res) {
   var clipFiles = req.files || [];
   var segments;
   try {
@@ -452,7 +787,6 @@ app.post('/autoedit', function (req, res, next) {
   }
 
   var jobId = req.jobId || crypto.randomUUID();
-  activeJobs++;
   try {
     var items = [];
     for (var i = 0; i < clipFiles.length; i++) {
@@ -473,8 +807,6 @@ app.post('/autoedit', function (req, res, next) {
     console.error('[autoedit] erro inesperado:', err);
     await cleanupFiles(clipFiles);
     if (!res.headersSent) res.status(500).json({ error: 'Não consegui processar o auto edit no servidor.' });
-  } finally {
-    activeJobs--;
   }
 });
 
@@ -543,7 +875,7 @@ function geminiErrorResponse(res, err, fallbackMsg) {
 
 // ========================= /autoedit/smart =========================
 
-function buildEditPrompt(clips, targetSeconds, voice) {
+function buildEditPrompt(clips, targetSeconds, voice, contexto) {
   var lista = clips.map(function (c) {
     return '- Clipe ' + c.indice + ': duração real ' + c.duracao.toFixed(1) + 's';
   }).join('\n');
@@ -554,8 +886,10 @@ function buildEditPrompt(clips, targetSeconds, voice) {
   var abertura = [
     'Você é um montador com 15 anos de carreira editando vídeo de imóveis para imobiliárias — e ao mesmo tempo um editor nativo de TikTok e Reels que roda mídia paga: sabe que o vídeo morre nos primeiros 2 segundos se o hook for fraco, pensa em taxa de retenção, e monta no CapCut todo dia (cortes secos no movimento, ritmo que não deixa o dedo rolar a tela).',
     '',
-    'Vou te mandar ' + n + ' clipes brutos de UM imóvel à venda, filmados no celular/gimbal, identificados como "Clipe 0", "Clipe 1"… na ordem de envio — que NÃO é a ordem do vídeo. A ordem é decisão sua. Os vídeos chegam em baixa resolução só pra análise; os tempos que você devolver serão aplicados no arquivo original, com a mesma linha do tempo. Duração real de cada clipe:',
+    'Vou te mandar ' + n + ' clipes brutos de UM imóvel, filmados no celular/gimbal, identificados como "Clipe 0", "Clipe 1"… na ordem de envio — que NÃO é a ordem do vídeo. A ordem é decisão sua. Os vídeos chegam em baixa resolução só pra análise; os tempos que você devolver serão aplicados no arquivo original, com a mesma linha do tempo. Duração real de cada clipe:',
     lista,
+    '',
+    'O imóvel: ' + (contexto && contexto.tipoImovel ? contexto.tipoImovel : 'não informado') + ' · anúncio de ' + (contexto && contexto.anuncio ? contexto.anuncio : 'venda') + (contexto && contexto.bairro ? ' · ' + contexto.bairro : '') + '. Descreva os ambientes com as palavras certas pra esse tipo de imóvel (num sítio ou terreno não existe "sala de estar do apartamento"; numa sala comercial não existe "quarto").',
     '',
   ];
 
@@ -592,7 +926,7 @@ function buildEditPrompt(clips, targetSeconds, voice) {
     regras = regras.concat([
       '2. HOOK (ordem 0). Abre com o plano mais impactante do lote: vista, sala ampla com luz natural, varanda, piscina, cozinha gourmet, um reveal. Nunca abre com corredor, banheiro, lavanderia ou plano escuro. O corte do hook é curto (1.2 a 2.2s) e já começa com a câmera em movimento — nada de começo parado ou "respiro".',
       '',
-      '3. PERCURSO. Depois do hook, monte uma visita que faça sentido no espaço: área social → cozinha → quartos (suíte por último entre os quartos) → banheiros → diferenciais (varanda, vista, lazer). Pode quebrar essa lógica se isso melhorar o ritmo ou a continuidade de movimento.',
+      '3. PERCURSO. Depois do hook, monte uma visita que faça sentido no espaço: área social → cozinha → quartos (suíte por último entre os quartos) → banheiros → diferenciais (varanda, vista, lazer). Se não for apartamento ou casa (sítio, terreno, sala comercial, loja, galpão), adapte: chegada/acesso → área principal → ambientes internos → área externa e diferenciais → vista. Pode quebrar essa lógica se isso melhorar o ritmo ou a continuidade de movimento.',
       '',
       '4. CONTINUIDADE DE MOVIMENTO (o que separa montagem amadora de profissional). Entre dois cortes seguidos, prefira movimentos que continuam na mesma direção (pan pra direita → pan pra direita, push-in → push-in) ou que se completam (fim de um travelling → começo de outro no mesmo sentido). Evite colar movimentos opostos (pan pra direita seguido de pan pra esquerda) e evite dois planos parados seguidos.',
       '',
@@ -765,64 +1099,109 @@ async function makeAnalysisProxy(inputPath, outputPath) {
   return r.code === 0;
 }
 
+function cleanCtx(v) { return String(v || '').replace(/[\r\n]+/g, ' ').slice(0, 60).trim(); }
+
+// fala que cai em cima de cada corte: cada frase vai pro corte que fica mais
+// tempo na tela enquanto ela é falada
+function assignFala(plan, locucao) {
+  var t = 0;
+  var spans = plan.map(function (e) {
+    var a = t; t += (e.fim - e.inicio) + (e.hold || 0);
+    e.fala = '';
+    return [a, t];
+  });
+  (locucao || []).forEach(function (f) {
+    var best = -1, bestOv = 0;
+    spans.forEach(function (sp, i) {
+      var ov = Math.min(sp[1], f.fim) - Math.max(sp[0], f.inicio);
+      if (ov > bestOv) { bestOv = ov; best = i; }
+    });
+    if (best >= 0) plan[best].fala = (plan[best].fala + ' ' + f.texto).trim().slice(0, 220);
+  });
+}
+
+// monta o payload do plano que vai no header (e fica guardado pra remontar)
+function buildPlanPayload(resumo, plano, fora, clips, voice, locucao, tokens, custo) {
+  return {
+    modelo: GEMINI_TEXT_MODEL,
+    resumo: resumo,
+    comLocucao: !!voice,
+    duracaoFinal: Math.round(plano.reduce(function (s, e) { return s + (e.fim - e.inicio) + (e.hold || 0); }, 0) * 10) / 10,
+    plano: plano.map(function (e) {
+      return { indice: e.indice, nome: clips[e.indice].nome, ambiente: e.ambiente || '', movimento: e.movimento || '', nota: e.nota, inicio: e.inicio, fim: e.fim, hold: e.hold || 0, motivo: e.motivo || '', fala: e.fala || '' };
+    }),
+    fora: fora.map(function (e) {
+      return { indice: e.indice, nome: clips[e.indice].nome, ambiente: e.ambiente || '', nota: e.nota, inicio: e.inicio, fim: e.fim, motivo: e.motivo || '' };
+    }),
+    locucao: voice ? { duracao: r2(voice.duracao), frases: (locucao || []).length } : null,
+    tokens: tokens,
+    custoUSD: Math.round((custo || 0) * 10000) / 10000,
+  };
+}
+
+// guarda o vídeo montado, gera a prévia leve e manda pro celular
+async function finishMontagem(req, res, jobId, montagem, outputPath, planPayload, tag) {
+  var stamp = Date.now().toString(36);
+  var montagemPath = tempName(jobId, 'montagem-' + stamp + '.mp4');
+  await fsp.rename(outputPath, montagemPath);
+  if (montagem.montagemPath && montagem.montagemPath !== montagemPath) cleanupPaths([montagem.montagemPath]);
+  montagem.montagemPath = montagemPath;
+  montagem.plan = planPayload;
+  storeMontagem(jobId, montagem);
+  var previewPath = tempName(jobId, 'preview-' + stamp + '.mp4');
+  var ok = await makePreview(montagemPath, previewPath);
+  res.setHeader('X-Autoedit-Plan', Buffer.from(JSON.stringify(planPayload), 'utf8').toString('base64'));
+  res.setHeader('X-Autoedit-Id', jobId);
+  if (!ok) {
+    // sem prévia leve: manda o original mesmo
+    return streamFileAndCleanup(res, montagemPath, 'video/mp4', 'giovani-montagem.mp4', function () {});
+  }
+  streamFileAndCleanup(res, previewPath, 'video/mp4', 'giovani-montagem-previa.mp4', function () { cleanupPaths([previewPath]); });
+}
+
 app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
   if (!geminiKey()) return res.status(503).json({ error: 'Chave do Gemini não configurada no servidor.' });
-  if (activeJobs >= MAX_CONCURRENT) {
-    return res.status(503).json({ error: 'Servidor ocupado, tenta de novo em alguns segundos.' });
-  }
   next();
-}, smartEditLimiter, uploadClips.fields([{ name: 'clips', maxCount: 10 }, { name: 'voice', maxCount: 1 }]), async function (req, res) {
+}, smartEditLimiter, uploadClips.fields([{ name: 'clips', maxCount: 10 }, { name: 'voice', maxCount: 1 }]), waitSlot, async function (req, res) {
+  var t0 = Date.now();
   var clipFiles = (req.files && req.files.clips) || [];
   var voiceFile = req.files && req.files.voice && req.files.voice[0];
   var jobId = req.jobId || crypto.randomUUID();
   var proxyPaths = clipFiles.map(function (f, i) { return tempName(jobId, 'proxy' + i + '.mp4'); });
   var voice = null;
+  var contexto = { tipoImovel: cleanCtx(req.body && req.body.tipoImovel), anuncio: cleanCtx(req.body && req.body.anuncio), bairro: cleanCtx(req.body && req.body.bairro) };
+  var jobInfo = { endpoint: 'montagem', clipes: clipFiles.length, mb: Math.round(clipFiles.reduce(function (s, f) { return s + f.size; }, 0) / 1048576), comVoz: !!voiceFile, anuncio: contexto.anuncio };
   function cleanupInputs() {
     var extra = voiceFile ? [voiceFile] : [];
     return cleanupFiles(clipFiles.concat(extra)).then(function () {
       return cleanupPaths(proxyPaths.concat(voice && voice.cleanPath ? [voice.cleanPath, voice.aiPath] : []));
     });
   }
-  if (clipFiles.length < 2) {
-    await cleanupInputs();
-    return res.status(400).json({ error: 'Manda pelo menos 2 vídeos.' });
+  function fail(status, msg, erro) {
+    logJob(Object.assign({}, jobInfo, { ok: false, erro: erro || msg, ms: Date.now() - t0 }));
+    return cleanupInputs().then(function () { if (!res.headersSent) res.status(status).json({ error: msg }); });
   }
+  if (clipFiles.length < 2) return fail(400, 'Manda pelo menos 2 vídeos.', 'poucos clipes');
 
-  activeJobs++;
   try {
     // 0) locução (opcional): trata a voz e mede a duração
     if (voiceFile) {
       voice = await prepareVoice(voiceFile.path, jobId);
-      if (!voice) {
-        await cleanupInputs();
-        return res.status(400).json({ error: 'Não consegui ler o áudio da locução. Grava de novo ou envia outro arquivo.' });
-      }
-      if (voice.empty) {
-        voice = null;
-        await cleanupInputs();
-        return res.status(400).json({ error: 'A locução ficou sem voz (só silêncio). Confere o microfone e grava de novo.' });
-      }
-      if (voice.duracao > 125) {
-        await cleanupInputs();
-        return res.status(400).json({ error: 'A locução passou de 2 minutos. Pra Reels, o ideal é até 60 segundos.' });
-      }
+      if (!voice) return fail(400, 'Não consegui ler o áudio da locução. Grava de novo ou envia outro arquivo.', 'audio ilegivel');
+      if (voice.empty) { voice = null; return fail(400, 'A locução ficou sem voz (só silêncio). Confere o microfone e grava de novo.', 'audio mudo'); }
+      if (voice.duracao > 125) return fail(400, 'A locução passou de 2 minutos. Pra Reels, o ideal é até 60 segundos.', 'audio longo');
       voice.alvo = r2(voice.duracao + 0.6); // meio segundo de respiro no fim
+      jobInfo.vozSeg = Math.round(voice.duracao);
     }
 
     // 1) duração real + proxy de análise de cada clipe
     var clips = [];
     for (var i = 0; i < clipFiles.length; i++) {
       var dur = await probeDuration(clipFiles[i].path);
-      if (!dur) {
-        await cleanupInputs();
-        return res.status(400).json({ error: 'Não consegui ler o vídeo ' + (i + 1) + ' (' + clipFiles[i].originalname + '). Tenta outro arquivo.' });
-      }
+      if (!dur) return fail(400, 'Não consegui ler o vídeo ' + (i + 1) + ' (' + clipFiles[i].originalname + '). Tenta outro arquivo.', 'clipe ilegivel');
       var ok = await makeAnalysisProxy(clipFiles[i].path, proxyPaths[i]);
-      if (!ok) {
-        await cleanupInputs();
-        return res.status(500).json({ error: 'Não consegui preparar o vídeo ' + (i + 1) + ' pra análise.' });
-      }
-      clips.push({ indice: i, duracao: dur, nome: clipFiles[i].originalname });
+      if (!ok) return fail(500, 'Não consegui preparar o vídeo ' + (i + 1) + ' pra análise.', 'proxy');
+      clips.push({ indice: i, duracao: dur, nome: clipFiles[i].originalname, path: clipFiles[i].path });
     }
 
     var totalRaw = clips.reduce(function (s, c) { return s + c.duracao; }, 0);
@@ -830,8 +1209,9 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
       ? voice.alvo
       : Math.round(Math.min(35, Math.max(10, Math.min(totalRaw * 0.6, clips.length * 2.8))));
 
-    // 2) IA monta a edição (vendo os clipes e, se tiver, ouvindo a locução)
-    var parts = [{ text: buildEditPrompt(clips, targetSeconds, voice) }];
+    // 2) IA monta a edição (vendo os clipes e, se tiver, ouvindo a locução).
+    // Durante a espera da IA a vaga de processamento fica livre.
+    var parts = [{ text: buildEditPrompt(clips, targetSeconds, voice, contexto) }];
     for (var j = 0; j < clips.length; j++) {
       var data = await fsp.readFile(proxyPaths[j]);
       parts.push({ text: 'Clipe ' + j + ' (duração real ' + clips[j].duracao.toFixed(1) + 's):' });
@@ -842,17 +1222,22 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
       parts.push({ text: 'Locução (duração ' + voice.duracao.toFixed(1) + 's):' });
       parts.push({ inline_data: { mime_type: 'audio/wav', data: voiceData.toString('base64') } });
     }
+    pauseSlot(req);
+    var tIa = Date.now();
     var json = await callGemini('v1beta', GEMINI_TEXT_MODEL, {
       contents: [{ role: 'user', parts: parts }],
       generationConfig: { responseMimeType: 'application/json', temperature: 0.4 },
     }, 4 * 60 * 1000);
+    jobInfo.msIa = Date.now() - tIa;
     parts = null;
-    await cleanupPaths(proxyPaths);
+    await cleanupPaths(proxyPaths.concat(voice ? [voice.aiPath] : []));
+    if (!(await resumeSlot(req, 3 * 60 * 1000))) return fail(503, 'Servidor ocupado, tenta de novo em alguns segundos.', 'fila cheia');
 
     var text = responseText(json).trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/```\s*$/, '');
     var parsed = null;
     try { parsed = JSON.parse(text); } catch (e) {
       console.error('[smart] JSON da IA inválido:', text.slice(0, 600));
+      jobInfo.jsonInvalido = true;
     }
     var result = normalizePlan(parsed, clips, voice);
 
@@ -866,38 +1251,73 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
       return { path: clipFiles[e.indice].path, inicio: e.inicio, fim: e.fim, hold: e.hold || 0 };
     });
     var out = await trimAndConcat(items, jobId, { audioPath: voice ? voice.cleanPath : null });
-    if (!out.ok) {
+    if (!out.ok) return fail(500, out.error, 'corte');
+
+    var planPayload = buildPlanPayload(result.resumo, result.plano, result.fora, clips, voice, result.locucao, { entrada: inTok, saida: outTok }, custo);
+    logJob(Object.assign({}, jobInfo, { ok: true, ms: Date.now() - t0, cortes: result.plano.length, duracao: planPayload.duracaoFinal, tokens: inTok + outTok, custoUSD: planPayload.custoUSD }));
+    // os originais ficam guardados (1h) pra aplicar a arte e pra remontar
+    var montagem = {
+      clips: clips.map(function (c) { return { path: c.path, duracao: c.duracao, nome: c.nome }; }),
+      voice: voice ? { cleanPath: voice.cleanPath, alvo: voice.alvo, duracao: voice.duracao } : null,
+      locucao: result.locucao,
+    };
+    await finishMontagem(req, res, jobId, montagem, out.outputPath, planPayload, 'smart');
+  } catch (err) {
+    if (err instanceof GeminiError) {
+      logJob(Object.assign({}, jobInfo, { ok: false, erro: 'IA: ' + err.message, ms: Date.now() - t0 }));
       await cleanupInputs();
-      if (!res.headersSent) res.status(500).json({ error: out.error });
+      if (!res.headersSent) geminiErrorResponse(res, err, 'Não consegui processar a montagem no servidor.');
       return;
     }
+    console.error('[smart] erro inesperado:', err);
+    await fail(500, 'Não consegui processar a montagem no servidor.', 'inesperado');
+  }
+});
 
-    var planPayload = {
-      modelo: GEMINI_TEXT_MODEL,
-      resumo: result.resumo,
-      comLocucao: !!voice,
-      duracaoFinal: Math.round(result.plano.reduce(function (s, e) { return s + (e.fim - e.inicio) + (e.hold || 0); }, 0) * 10) / 10,
-      plano: result.plano.map(function (e) {
-        return { indice: e.indice, nome: clips[e.indice].nome, ambiente: e.ambiente, movimento: e.movimento, nota: e.nota, inicio: e.inicio, fim: e.fim, hold: e.hold || 0, motivo: e.motivo, fala: e.fala || '' };
-      }),
-      fora: result.fora.map(function (e) {
-        return { indice: e.indice, nome: clips[e.indice].nome, ambiente: e.ambiente, nota: e.nota, motivo: e.motivo };
-      }),
-      locucao: voice ? { duracao: r2(voice.duracao), frases: result.locucao.length } : null,
-      tokens: { entrada: inTok, saida: outTok },
-      custoUSD: Math.round(custo * 10000) / 10000,
-    };
-    res.setHeader('X-Autoedit-Plan', Buffer.from(JSON.stringify(planPayload), 'utf8').toString('base64'));
-    var voiceCleanup = voice ? [voice.cleanPath, voice.aiPath] : [];
-    streamFileAndCleanup(res, out.outputPath, 'video/mp4', 'giovani-autoedit.mp4', function () {
-      cleanupFiles(clipFiles.concat(voiceFile ? [voiceFile] : [], [{ path: out.outputPath }]));
-      cleanupPaths(voiceCleanup);
-    });
+// ========================= /autoedit/remontar =========================
+// Ajuste manual: o corretor tira, recoloca ou reordena cortes. Usa os clipes
+// que ficaram guardados — nada é reenviado e a IA não é chamada de novo.
+app.post('/autoedit/remontar', requireSiteOrigin, express.json({ limit: '32kb' }), waitSlot, async function (req, res) {
+  var t0 = Date.now();
+  var id = req.body && req.body.id;
+  var m = getMontagem(id);
+  if (!m) return res.status(410).json({ error: MONTAGEM_EXPIRADA });
+  var cortes = Array.isArray(req.body.cortes) ? req.body.cortes.slice(0, 12) : [];
+  var old = {};
+  (m.plan.plano || []).concat(m.plan.fora || []).forEach(function (e) { old[e.indice] = e; });
+  var used = {};
+  var plan = [];
+  cortes.forEach(function (c) {
+    var idx = Number(c && c.indice);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= m.clips.length || used[idx]) return;
+    used[idx] = true;
+    var base = old[idx] || {};
+    var seg = clampSegment(c.inicio != null ? c.inicio : base.inicio, c.fim != null ? c.fim : base.fim, m.clips[idx].duracao);
+    plan.push({ indice: idx, ambiente: base.ambiente || '', movimento: base.movimento || '', nota: base.nota, motivo: base.motivo || '', inicio: seg.inicio, fim: seg.fim, hold: 0 });
+  });
+  if (!plan.length) return res.status(400).json({ error: 'A montagem precisa de pelo menos 1 corte.' });
+  if (m.voice) fitPlanToDuration(plan, m.clips, m.voice.alvo);
+  if (m.voice) assignFala(plan, m.locucao);
+  var fora = m.clips.map(function (c, i) { return i; }).filter(function (i) { return !used[i]; }).map(function (i) {
+    var b = old[i] || {};
+    var seg = clampSegment(b.inicio, b.fim, m.clips[i].duracao);
+    return { indice: i, ambiente: b.ambiente || '', nota: b.nota, inicio: seg.inicio, fim: seg.fim, motivo: b.motivo || 'Tirado da montagem por você' };
+  });
+  try {
+    var items = plan.map(function (e) { return { path: m.clips[e.indice].path, inicio: e.inicio, fim: e.fim, hold: e.hold || 0 }; });
+    var out = await trimAndConcat(items, id + '-r' + Date.now().toString(36), { audioPath: m.voice ? m.voice.cleanPath : null });
+    if (!out.ok) {
+      logJob({ endpoint: 'remontar', ok: false, erro: 'corte', ms: Date.now() - t0 });
+      return res.status(500).json({ error: out.error });
+    }
+    var planPayload = buildPlanPayload(m.plan.resumo, plan, fora, m.clips, m.voice, m.locucao, m.plan.tokens, m.plan.custoUSD);
+    planPayload.ajustadaPeloCorretor = true;
+    logJob({ endpoint: 'remontar', ok: true, ms: Date.now() - t0, cortes: plan.length });
+    await finishMontagem(req, res, id, m, out.outputPath, planPayload, 'remontar');
   } catch (err) {
-    await cleanupInputs();
-    if (!res.headersSent) geminiErrorResponse(res, err, 'Não consegui processar o auto edit no servidor.');
-  } finally {
-    activeJobs--;
+    console.error('[remontar] erro inesperado:', err);
+    logJob({ endpoint: 'remontar', ok: false, erro: 'inesperado', ms: Date.now() - t0 });
+    if (!res.headersSent) res.status(500).json({ error: 'Não consegui refazer a montagem.' });
   }
 });
 
@@ -924,6 +1344,8 @@ const ENHANCE_PROMPT = [
   'Output a single photorealistic image with the same aspect ratio as the input. No text, no watermark, no borders.',
 ].join('\n');
 
+// preço aproximado por imagem gerada (Gemini 3.1 Flash Image, set/2026)
+const IMAGE_PRICE_USD = { '1K': 0.067, '2K': 0.101, '4K': 0.151 };
 const IMAGE_ASPECTS = [
   ['1:1', 1], ['2:3', 2 / 3], ['3:2', 3 / 2], ['3:4', 3 / 4], ['4:3', 4 / 3],
   ['4:5', 4 / 5], ['5:4', 5 / 4], ['9:16', 9 / 16], ['16:9', 16 / 9], ['21:9', 21 / 9],
@@ -980,6 +1402,7 @@ app.post('/enhance-photo', requireSiteOrigin, function (req, res, next) {
   ];
 
   activeAiJobs++;
+  var tFoto = Date.now();
   try {
     var variants = imageRequestVariants(parts, aspect, size);
     if (workingImageVariant) {
@@ -1011,7 +1434,11 @@ app.post('/enhance-photo', requireSiteOrigin, function (req, res, next) {
         break;
       }
     }
-    if (!image) return geminiErrorResponse(res, lastErr, 'Não consegui melhorar a foto.');
+    if (!image) {
+      logJob({ endpoint: 'foto', ok: false, erro: lastErr ? String(lastErr.message).slice(0, 80) : 'sem imagem', ms: Date.now() - tFoto, tamanho: size });
+      return geminiErrorResponse(res, lastErr, 'Não consegui melhorar a foto.');
+    }
+    logJob({ endpoint: 'foto', ok: true, ms: Date.now() - tFoto, tamanho: size, custoUSD: IMAGE_PRICE_USD[size] || 0.1 });
 
     var buf = Buffer.from(image.data, 'base64');
     var ext = /jpe?g/.test(image.mime) ? 'jpg' : (/webp/.test(image.mime) ? 'webp' : 'png');
@@ -1044,9 +1471,12 @@ setInterval(function () {
   fs.readdir(dir, function (err, files) {
     if (err) return;
     var now = Date.now();
+    var guardados = new Set();
+    MONTAGENS.forEach(function (m) { montagemFiles(m).forEach(function (f) { guardados.add(f); }); });
     files.forEach(function (name) {
       if (!/^sg-[0-9a-f-]{36}-/.test(name)) return;
       var fp = path.join(dir, name);
+      if (guardados.has(fp)) return; // montagem guardada: sai pelo prazo dela (1h)
       fs.stat(fp, function (err, stat) {
         if (err) return;
         if (now - stat.mtimeMs > 30 * 60 * 1000) fs.unlink(fp, function () {});
