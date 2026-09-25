@@ -760,6 +760,13 @@ app.get('/render/progresso/:id', function (req, res) {
   res.json(p ? { fase: p.fase, pct: Math.round(p.pct * 1000) / 1000 } : { fase: 'fila', pct: 0 });
 });
 
+app.get('/autoedit/plano/:id', requireSiteOrigin, function (req, res) {
+  var m = getMontagem(req.params.id);
+  if (!m) return res.status(410).json({ error: MONTAGEM_EXPIRADA });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(m.plan);
+});
+
 // Baixar a montagem sem a arte, na qualidade original.
 app.get('/montagem/:id', requireSiteOrigin, function (req, res) {
   var m = getMontagem(req.params.id);
@@ -1150,7 +1157,11 @@ async function finishMontagem(req, res, jobId, montagem, outputPath, planPayload
   storeMontagem(jobId, montagem);
   var previewPath = tempName(jobId, 'preview-' + stamp + '.mp4');
   var ok = await makePreview(montagemPath, previewPath);
-  res.setHeader('X-Autoedit-Plan', Buffer.from(JSON.stringify(planPayload), 'utf8').toString('base64'));
+  // O plano vai num GET separado (/autoedit/plano/:id): com muitos clipes e
+  // locução ele passa de 8 KB e o proxy do Railway derruba a resposta.
+  // Só vai no cabeçalho quando é pequeno (compatível com o site antigo).
+  var planB64 = Buffer.from(JSON.stringify(planPayload), 'utf8').toString('base64');
+  if (planB64.length <= 3500) res.setHeader('X-Autoedit-Plan', planB64);
   res.setHeader('X-Autoedit-Id', jobId);
   if (!ok) {
     // sem prévia leve: manda o original mesmo
