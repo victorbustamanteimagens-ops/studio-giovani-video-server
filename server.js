@@ -674,22 +674,26 @@ app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'over
   var inputPath = videoFile ? videoFile.path : montagem.montagemPath;
   var origem = videoFile ? 'upload' : 'montagem';
   var progId = cleanProgressId(req.body && req.body.progressId);
+  // Modo assíncrono: o site recebe a resposta na hora e acompanha pelo
+  // /render/progresso. Vídeo longo não fica preso numa conexão de vários
+  // minutos (o proxy derrubava e o site via "falha de conexão").
+  var isAsync = !!(progId && req.body && req.body.async === '1');
   setRenderProgress(progId, 'processando', 0);
-  var inputDur = progId ? await probeDuration(inputPath) : null;
+  var inputDur = await probeDuration(inputPath);
   var watch = ffmpegProgressWatcher(progId, inputDur);
+  var mb = videoFile ? Math.round(videoFile.size / 1048576) : 0;
+  var limiteMs = (isAsync ? 15 : 5) * 60 * 1000;
+  // vídeo longo: preset mais rápido pra caber no tempo
+  var preset = inputDur && inputDur > 75 ? 'superfast' : 'veryfast';
 
   var outputPath = tempName(req.jobId || crypto.randomUUID(), 'output.mp4');
   // "format=auto" no overlay deixa o ffmpeg escolher o pixel format --
-  // como o overlay tem alpha, ele quase sempre escolhe yuv444p (3 planos em
-  // resolucao cheia) em vez do yuv420p padrao. Isso, combinado com o
-  // ffmpeg detectando dezenas de "cpus" dentro do container (mas so tendo
-  // a memoria de uma instancia pequena de verdade), faz o libx264 abrir
-  // threads e buffers demais e o processo morre (OOM/kill do container --
-  // Node ve so "code: null", sem mensagem de erro nenhuma). Forcamos
-  // yuv420p (padrao pra Reels/Stories de qualquer forma) e limitamos as
-  // threads do encoder pra manter o uso de memoria previsivel.
+  // como o overlay tem alpha, ele quase sempre escolhe yuv444p. Forcamos
+  // yuv420p e limitamos as threads do encoder pra manter a memoria
+  // previsivel numa instancia pequena. fps=30 antes de escalar: video de
+  // celular em 60 fps dobrava o trabalho sem ganho no Reels.
   var filter =
-    '[0:v]scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,' +
+    '[0:v]fps=30,scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,' +
     'crop=' + W + ':' + H + ',setsar=1[bg];' +
     '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[outv]';
 
@@ -697,67 +701,97 @@ app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'over
     '-y', '-i', inputPath, '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]', '-map', '0:a?',
-    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', preset, '-crf', '23',
     '-c:a', 'aac', '-movflags', '+faststart',
     outputPath,
   ];
-  // Alguns celulares (iPhone com audio espacial, por exemplo) gravam o
-  // audio num codec que esse ffmpeg nao sabe decodificar ("unknown
-  // codec") -- a 1a tentativa falha inteira por causa disso. Em vez de
-  // devolver erro pro usuario, tentamos de novo sem audio: o Reels/Stories
-  // deixa adicionar musica por cima depois de qualquer forma.
+  // Alguns celulares (iPhone com audio espacial) gravam o audio num codec
+  // que esse ffmpeg nao decodifica -- tentamos de novo sem audio.
   var noAudioArgs = [
     '-y', '-i', inputPath, '-i', overlayFile.path,
     '-filter_complex', filter,
     '-map', '[outv]',
-    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '23',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', preset, '-crf', '23',
     '-an', '-movflags', '+faststart',
     outputPath,
   ];
 
-  try {
-    var result = await runFfmpegWithTimeout(withAudioArgs, 5 * 60 * 1000, watch);
+  var releaseSlot = req._releaseSlot || function () {};
+  var inputs = [videoFile, overlayFile];
+  function fail(status, msg, erro) {
+    cleanupFiles(inputs.concat([{ path: outputPath }]));
+    logJob({ endpoint: 'render', origem: origem, ok: false, erro: erro, ms: Date.now() - t0, mb: mb, seg: inputDur ? Math.round(inputDur) : null, async: isAsync });
+    if (isAsync) { setRenderError(progId, msg); releaseSlot(); }
+    else if (!res.headersSent) res.status(status).json({ error: msg });
+  }
+  if (isAsync) {
+    // a vaga de processamento passa a ser devolvida no fim do ffmpeg, não
+    // no fim desta resposta
+    res.removeListener('finish', releaseSlot);
+    res.removeListener('close', releaseSlot);
+    res.status(202).json({ id: progId, duracao: inputDur ? Math.round(inputDur) : null });
+  }
 
+  try {
+    var result = await runFfmpegWithTimeout(withAudioArgs, limiteMs, watch);
     if (result.code !== 0 && !result.timedOut) {
       console.error('[render] 1a tentativa (com audio) falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       await fsp.unlink(outputPath).catch(function () {});
       setRenderProgress(progId, 'processando', 0);
-      result = await runFfmpegWithTimeout(noAudioArgs, 5 * 60 * 1000, watch);
+      result = await runFfmpegWithTimeout(noAudioArgs, limiteMs, watch);
       if (result.code !== 0 && !result.timedOut) {
         console.error('[render] 2a tentativa (sem audio) tambem falhou, codigo', result.code, 'sinal', result.signal, '| stderr:', result.stderrTail.slice(-800));
       }
     }
+    if (result.timedOut) return fail(504, 'O vídeo é longo demais para processar (passou de ' + Math.round(limiteMs / 60000) + ' minutos). Corte o vídeo em partes menores e tente de novo.', 'timeout');
+    if (result.code !== 0) return fail(500, 'Não deu pra gerar o vídeo. Tenta de novo, ou com outro arquivo.', 'ffmpeg ' + result.code);
 
-    if (result.timedOut) {
-      await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
-      logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'timeout', ms: Date.now() - t0 });
-      if (!res.headersSent) res.status(504).json({ error: 'O processamento demorou demais e foi cancelado. Tenta com um vídeo menor.' });
+    logJob({ endpoint: 'render', origem: origem, ok: true, ms: Date.now() - t0, mb: mb, seg: inputDur ? Math.round(inputDur) : null, async: isAsync });
+    if (isAsync) {
+      cleanupFiles(inputs);
+      RENDER_RESULTS.set(progId, { path: outputPath, t: Date.now() });
+      setRenderProgress(progId, 'pronto', 1);
+      releaseSlot();
       return;
     }
-    if (result.code !== 0) {
-      await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
-      logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'ffmpeg ' + result.code, ms: Date.now() - t0 });
-      if (!res.headersSent) res.status(500).json({ error: 'Não deu pra gerar o vídeo. Tenta de novo, ou com outro arquivo.' });
-      return;
-    }
-
     setRenderProgress(progId, 'enviando', 1);
-    logJob({ endpoint: 'render', origem: origem, ok: true, ms: Date.now() - t0, mb: videoFile ? Math.round(videoFile.size / 1048576) : 0 });
     streamFileAndCleanup(res, outputPath, 'video/mp4', 'giovani-video.mp4', function () {
-      cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
+      cleanupFiles(inputs.concat([{ path: outputPath }]));
     });
   } catch (err) {
     console.error('[render] erro inesperado:', err);
-    await cleanupFiles([videoFile, overlayFile, { path: outputPath }]);
-    logJob({ endpoint: 'render', origem: origem, ok: false, erro: 'inesperado', ms: Date.now() - t0 });
-    if (!res.headersSent) res.status(500).json({ error: 'Não consegui processar o vídeo no servidor.' });
+    fail(500, 'Não consegui processar o vídeo no servidor.', 'inesperado');
   }
+});
+
+// Resultado do render assíncrono (baixado uma vez; some depois de 30 min).
+const RENDER_RESULTS = new Map();
+const RENDER_ERRORS = new Map();
+function setRenderError(id, msg) {
+  if (!id) return;
+  RENDER_ERRORS.set(id, msg);
+  setRenderProgress(id, 'erro', 0);
+}
+setInterval(function () {
+  var lim = Date.now() - 30 * 60 * 1000;
+  RENDER_RESULTS.forEach(function (v, k) { if (v.t < lim) { cleanupPaths([v.path]); RENDER_RESULTS.delete(k); } });
+  RENDER_ERRORS.forEach(function (v, k) { if (!RENDER_PROGRESS.has(k)) RENDER_ERRORS.delete(k); });
+}, 5 * 60 * 1000).unref();
+
+app.get('/render/resultado/:id', function (req, res) {
+  var id = cleanProgressId(req.params.id);
+  var r = RENDER_RESULTS.get(id);
+  if (!r) return res.status(410).json({ error: 'O vídeo pronto expirou. Gere de novo.' });
+  RENDER_RESULTS.delete(id);
+  streamFileAndCleanup(res, r.path, 'video/mp4', 'giovani-video.mp4', function () { cleanupPaths([r.path]); });
 });
 
 app.get('/render/progresso/:id', function (req, res) {
   var p = RENDER_PROGRESS.get(cleanProgressId(req.params.id));
   res.setHeader('Cache-Control', 'no-store');
-  res.json(p ? { fase: p.fase, pct: Math.round(p.pct * 1000) / 1000 } : { fase: 'fila', pct: 0 });
+  var out = p ? { fase: p.fase, pct: Math.round(p.pct * 1000) / 1000 } : { fase: 'fila', pct: 0 };
+  if (p && p.fase === 'erro') out.erro = RENDER_ERRORS.get(cleanProgressId(req.params.id)) || 'Não deu pra gerar o vídeo.';
+  res.json(out);
 });
 
 app.get('/autoedit/plano/:id', requireSiteOrigin, function (req, res) {
@@ -1484,6 +1518,7 @@ setInterval(function () {
     var now = Date.now();
     var guardados = new Set();
     MONTAGENS.forEach(function (m) { montagemFiles(m).forEach(function (f) { guardados.add(f); }); });
+    RENDER_RESULTS.forEach(function (r) { guardados.add(r.path); });
     files.forEach(function (name) {
       if (!/^sg-[0-9a-f-]{36}-/.test(name)) return;
       var fp = path.join(dir, name);
