@@ -101,6 +101,7 @@ function makeRateLimiter(name, perIpPerHour, globalPerDay) {
 }
 const enhanceLimiter = makeRateLimiter('enhance', Number(process.env.ENHANCE_PER_IP_HOUR || 40), Number(process.env.ENHANCE_PER_DAY || 400));
 const smartEditLimiter = makeRateLimiter('smart', Number(process.env.SMART_PER_IP_HOUR || 15), Number(process.env.SMART_PER_DAY || 150));
+const legendaLimiter = makeRateLimiter('legenda', Number(process.env.LEGENDA_PER_IP_HOUR || 30), Number(process.env.LEGENDA_PER_DAY || 300));
 
 // Limite de jobs de ffmpeg simultâneos — instância pequena, evita derrubar o
 // servidor se vários renders caírem ao mesmo tempo.
@@ -186,7 +187,7 @@ function logJob(data) {
 const EVENTOS_OK = new Set([
   'app_aberto', 'aba', 'midia', 'melhorar_foto', 'montagem', 'remontagem', 'ouvir_previa', 'locucao',
   'validacao_bloqueou', 'conferencia', 'gerar', 'pronto_salvar', 'pronto_compartilhar', 'pronto_fechar',
-  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro',
+  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro', 'legenda',
 ]);
 const eventsLimiter = makeRateLimiter('events', Number(process.env.EVENTS_PER_IP_HOUR || 600), Number(process.env.EVENTS_PER_DAY || 50000));
 function cleanProps(p) {
@@ -392,6 +393,10 @@ const upload = multer({
     filename: function (req, file, cb) {
       var id = req.jobId || (req.jobId = crypto.randomUUID());
       var suffix = file.fieldname === 'overlay' ? 'overlay.png' : 'input.mp4';
+      if (file.fieldname === 'legenda') {
+        var li = req._legCounter === undefined ? (req._legCounter = 0) : ++req._legCounter;
+        suffix = 'leg' + li + '.png';
+      }
       cb(null, 'sg-' + id + '-' + suffix);
     },
   }),
@@ -651,28 +656,147 @@ function streamFileAndCleanup(res, filePath, contentType, downloadName, cleanup)
   });
 }
 
+// ============================ vídeos guardados ============================
+// O vídeo que sobe pra gerar a legenda fica 1 hora no servidor: na hora de
+// gerar o vídeo final, o site manda só o id (não sobe o arquivo de novo).
+const VIDEOS_GUARDADOS = new Map();
+const VIDEO_EXPIRADO = 'O vídeo guardado no servidor expirou. Envie o vídeo de novo.';
+function guardarVideo(id, filePath) {
+  VIDEOS_GUARDADOS.set(id, { path: filePath, usadoEm: Date.now() });
+  if (VIDEOS_GUARDADOS.size > 6) {
+    var oldest = null;
+    VIDEOS_GUARDADOS.forEach(function (v, k) { if (!oldest || v.usadoEm < VIDEOS_GUARDADOS.get(oldest).usadoEm) oldest = k; });
+    if (oldest && oldest !== id) { cleanupPaths([VIDEOS_GUARDADOS.get(oldest).path]); VIDEOS_GUARDADOS.delete(oldest); }
+  }
+}
+function getVideoGuardado(id) {
+  if (!/^[0-9a-f-]{36}$/.test(String(id || ''))) return null;
+  var v = VIDEOS_GUARDADOS.get(id);
+  if (!v) return null;
+  if (Date.now() - v.usadoEm > 60 * 60 * 1000) { cleanupPaths([v.path]); VIDEOS_GUARDADOS.delete(id); return null; }
+  v.usadoEm = Date.now();
+  return v;
+}
+setInterval(function () {
+  VIDEOS_GUARDADOS.forEach(function (v, id) { if (Date.now() - v.usadoEm > 60 * 60 * 1000) { cleanupPaths([v.path]); VIDEOS_GUARDADOS.delete(id); } });
+}, 5 * 60 * 1000).unref();
+
+// ================================ /legenda ================================
+// Transcreve a fala do vídeo (ou da montagem guardada) com o Gemini e
+// devolve as frases com tempo, prontas pra virar legenda de 2 linhas.
+const LEGENDA_PROMPT = [
+  'Transcreva a fala deste áudio em português do Brasil, palavra por palavra, com pontuação e letras maiúsculas corretas.',
+  'Divida em blocos de legenda curtos: cada bloco com no máximo 42 caracteres, quebrando nas pausas naturais da fala.',
+  'Para cada bloco, dê o início e o fim em segundos (uma casa decimal), sincronizados com o momento exato da fala.',
+  'Os blocos não se sobrepõem e seguem a ordem do áudio.',
+  'Não invente palavras. Se um trecho for incompreensível, deixe de fora. Ignore música e ruídos.',
+  'Responda somente JSON neste formato: {"legendas":[{"inicio":0.0,"fim":2.1,"texto":"..."}]}.',
+  'Se não houver fala, responda {"legendas":[]}.',
+].join('\n');
+
+app.post('/legenda', requireSiteOrigin, function (req, res, next) {
+  if (!geminiKey()) return res.status(503).json({ error: 'Chave do Gemini não configurada no servidor.' });
+  next();
+}, legendaLimiter, upload.fields([{ name: 'video', maxCount: 1 }]), async function (req, res) {
+  var t0 = Date.now();
+  var videoFile = req.files && req.files.video && req.files.video[0];
+  var montagem = null;
+  if (!videoFile && req.body && req.body.montagemId) {
+    montagem = getMontagem(req.body.montagemId);
+    if (!montagem) return res.status(410).json({ error: MONTAGEM_EXPIRADA });
+  }
+  if (!videoFile && !montagem) return res.status(400).json({ error: 'Envie o vídeo.' });
+  var src = videoFile ? videoFile.path : montagem.montagemPath;
+  var jobId = req.jobId || crypto.randomUUID();
+  var audioPath = tempName(jobId, 'legenda-audio.mp3');
+  function fail(status, msg, erro) {
+    logJob({ endpoint: 'legenda', ok: false, erro: erro || msg, ms: Date.now() - t0, origem: videoFile ? 'video' : 'montagem' });
+    cleanupPaths([audioPath]);
+    if (videoFile) cleanupFiles([videoFile]);
+    if (!res.headersSent) res.status(status).json({ error: msg });
+  }
+  try {
+    var dur = await probeDuration(src);
+    if (!dur) return fail(400, 'Não consegui ler esse vídeo.', 'video ilegivel');
+    if (dur > 15 * 60) return fail(400, 'O vídeo passou de 15 minutos. Corte em partes menores.', 'longo');
+    var r = await runWithTimeout('ffmpeg', ['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', audioPath], 3 * 60 * 1000);
+    var st = await fsp.stat(audioPath).catch(function () { return null; });
+    if (r.code !== 0 || !st || st.size < 2000) return fail(400, 'Esse vídeo não tem som, então não dá pra fazer a legenda.', 'sem audio');
+    var data = await fsp.readFile(audioPath);
+    var json = await callGemini('v1beta', GEMINI_TEXT_MODEL, {
+      contents: [{ role: 'user', parts: [{ text: LEGENDA_PROMPT }, { inline_data: { mime_type: 'audio/mp3', data: data.toString('base64') } }] }],
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
+    }, 3 * 60 * 1000);
+    var text = responseText(json).trim().replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/```\s*$/, '');
+    var parsed = null;
+    try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+    var raw = parsed && Array.isArray(parsed.legendas) ? parsed.legendas : [];
+    var legendas = [];
+    raw.forEach(function (l) {
+      var a = Math.max(0, Number(l && l.inicio)), b = Math.min(dur, Number(l && l.fim));
+      var t = String((l && l.texto) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      if (!t || !isFinite(a) || !isFinite(b) || b <= a + 0.15) return;
+      legendas.push({ inicio: Math.round(a * 100) / 100, fim: Math.round(b * 100) / 100, texto: t });
+    });
+    legendas.sort(function (x, y) { return x.inicio - y.inicio; });
+    for (var i = 1; i < legendas.length; i++) {
+      if (legendas[i].inicio < legendas[i - 1].fim) legendas[i - 1].fim = Math.max(legendas[i - 1].inicio + 0.2, legendas[i].inicio);
+    }
+    var usage = json.usageMetadata || {};
+    var inTok = usage.promptTokenCount || 0, outTok = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
+    var custo = (inTok / 1e6) * PRICE_IN_PER_M + (outTok / 1e6) * PRICE_OUT_PER_M;
+    cleanupPaths([audioPath]);
+    var out = { legendas: legendas, duracao: Math.round(dur * 10) / 10 };
+    if (videoFile) { guardarVideo(jobId, videoFile.path); out.uploadId = jobId; }
+    logJob({ endpoint: 'legenda', ok: true, ms: Date.now() - t0, origem: videoFile ? 'video' : 'montagem', seg: Math.round(dur), frases: legendas.length, tokens: inTok + outTok, custoUSD: Math.round(custo * 10000) / 10000 });
+    res.json(out);
+  } catch (err) {
+    if (err instanceof GeminiError) {
+      logJob({ endpoint: 'legenda', ok: false, erro: 'IA: ' + err.message, ms: Date.now() - t0 });
+      cleanupPaths([audioPath]);
+      if (videoFile) cleanupFiles([videoFile]);
+      return geminiErrorResponse(res, err, 'Não consegui fazer a legenda.');
+    }
+    console.error('[legenda] erro inesperado:', err);
+    fail(500, 'Não consegui fazer a legenda.', 'inesperado');
+  }
+});
+
 // ================================ /render ================================
 
-app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'overlay', maxCount: 1 }]), waitSlot, async function (req, res) {
+app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'overlay', maxCount: 1 }, { name: 'legenda', maxCount: 80 }]), waitSlot, async function (req, res) {
   var t0 = Date.now();
   var videoFile = req.files && req.files.video && req.files.video[0];
   var overlayFile = req.files && req.files.overlay && req.files.overlay[0];
+  var legFiles = (req.files && req.files.legenda) || [];
+  var legInfo = [];
+  try { legInfo = JSON.parse((req.body && req.body.legendas) || '[]'); } catch (e) { legInfo = []; }
+  if (!Array.isArray(legInfo)) legInfo = [];
+  // Vídeo que já subiu pra gerar a legenda: não precisa subir de novo.
+  var guardado = null;
+  if (!videoFile && req.body && req.body.uploadId) {
+    guardado = getVideoGuardado(req.body.uploadId);
+    if (!guardado) {
+      await cleanupFiles([overlayFile].concat(legFiles));
+      return res.status(410).json({ error: VIDEO_EXPIRADO });
+    }
+  }
   // Montagem automática: o vídeo já está no servidor, só vem a arte (PNG).
   var montagem = null;
   if (!videoFile && req.body && req.body.montagemId) {
     montagem = getMontagem(req.body.montagemId);
     if (!montagem) {
-      await cleanupFiles([overlayFile]);
+      await cleanupFiles([overlayFile].concat(legFiles));
       return res.status(410).json({ error: MONTAGEM_EXPIRADA });
     }
   }
 
-  if ((!videoFile && !montagem) || !overlayFile) {
-    await cleanupFiles([videoFile, overlayFile]);
+  if ((!videoFile && !montagem && !guardado) || !overlayFile) {
+    await cleanupFiles([videoFile, overlayFile].concat(legFiles));
     return res.status(400).json({ error: 'Envie o campo "video" (ou "montagemId") e o campo "overlay" (PNG).' });
   }
-  var inputPath = videoFile ? videoFile.path : montagem.montagemPath;
-  var origem = videoFile ? 'upload' : 'montagem';
+  var inputPath = videoFile ? videoFile.path : (guardado ? guardado.path : montagem.montagemPath);
+  var origem = videoFile ? 'upload' : (guardado ? 'guardado' : 'montagem');
   var progId = cleanProgressId(req.body && req.body.progressId);
   // Modo assíncrono: o site recebe a resposta na hora e acompanha pelo
   // /render/progresso. Vídeo longo não fica preso numa conexão de vários
@@ -692,32 +816,48 @@ app.post('/render', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'over
   // yuv420p e limitamos as threads do encoder pra manter a memoria
   // previsivel numa instancia pequena. fps=30 antes de escalar: video de
   // celular em 60 fps dobrava o trabalho sem ganho no Reels.
+  // Legendas: um PNG por frase (desenhado no navegador, igual à prévia),
+  // cada um aparece só no seu intervalo de tempo.
+  var legs = [];
+  legFiles.forEach(function (f, i) {
+    var info = legInfo[i] || {};
+    var a = Number(info.inicio), b = Number(info.fim), y = Math.round(Number(info.y));
+    if (!isFinite(a) || !isFinite(b) || b <= a || !isFinite(y)) return;
+    legs.push({ path: f.path, a: Math.max(0, a), b: b, y: Math.max(0, Math.min(H - 10, y)) });
+  });
   var filter =
     '[0:v]fps=30,scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,' +
     'crop=' + W + ':' + H + ',setsar=1[bg];' +
-    '[bg][1:v]overlay=0:0:format=auto,format=yuv420p[outv]';
+    '[bg][1:v]overlay=0:0:format=auto' + (legs.length ? '[l0];' : ',format=yuv420p[outv]');
+  legs.forEach(function (l, i) {
+    var last = i === legs.length - 1;
+    filter += '[l' + i + '][' + (i + 2) + ':v]overlay=0:' + l.y + ':format=auto:enable=\'between(t,' + l.a.toFixed(2) + ',' + l.b.toFixed(2) + ')\'' +
+      (last ? ',format=yuv420p[outv]' : '[l' + (i + 1) + '];');
+  });
+  var legInputs = [];
+  legs.forEach(function (l) { legInputs.push('-i', l.path); });
 
   var withAudioArgs = [
-    '-y', '-i', inputPath, '-i', overlayFile.path,
+    '-y', '-i', inputPath, '-i', overlayFile.path].concat(legInputs, [
     '-filter_complex', filter,
     '-map', '[outv]', '-map', '0:a?',
     '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', preset, '-crf', '23',
     '-c:a', 'aac', '-movflags', '+faststart',
     outputPath,
-  ];
+  ]);
   // Alguns celulares (iPhone com audio espacial) gravam o audio num codec
   // que esse ffmpeg nao decodifica -- tentamos de novo sem audio.
   var noAudioArgs = [
-    '-y', '-i', inputPath, '-i', overlayFile.path,
+    '-y', '-i', inputPath, '-i', overlayFile.path].concat(legInputs, [
     '-filter_complex', filter,
     '-map', '[outv]',
     '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', preset, '-crf', '23',
     '-an', '-movflags', '+faststart',
     outputPath,
-  ];
+  ]);
 
   var releaseSlot = req._releaseSlot || function () {};
-  var inputs = [videoFile, overlayFile];
+  var inputs = [videoFile, overlayFile].concat(legFiles);
   function fail(status, msg, erro) {
     cleanupFiles(inputs.concat([{ path: outputPath }]));
     logJob({ endpoint: 'render', origem: origem, ok: false, erro: erro, ms: Date.now() - t0, mb: mb, seg: inputDur ? Math.round(inputDur) : null, async: isAsync });
@@ -1519,6 +1659,7 @@ setInterval(function () {
     var guardados = new Set();
     MONTAGENS.forEach(function (m) { montagemFiles(m).forEach(function (f) { guardados.add(f); }); });
     RENDER_RESULTS.forEach(function (r) { guardados.add(r.path); });
+    VIDEOS_GUARDADOS.forEach(function (v) { guardados.add(v.path); });
     files.forEach(function (name) {
       if (!/^sg-[0-9a-f-]{36}-/.test(name)) return;
       var fp = path.join(dir, name);
