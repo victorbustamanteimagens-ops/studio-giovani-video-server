@@ -187,7 +187,7 @@ function logJob(data) {
 const EVENTOS_OK = new Set([
   'app_aberto', 'aba', 'midia', 'melhorar_foto', 'montagem', 'remontagem', 'ouvir_previa', 'locucao',
   'validacao_bloqueou', 'conferencia', 'gerar', 'pronto_salvar', 'pronto_compartilhar', 'pronto_fechar',
-  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro', 'legenda',
+  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro', 'legenda', 'legenda_post',
 ]);
 const eventsLimiter = makeRateLimiter('events', Number(process.env.EVENTS_PER_IP_HOUR || 600), Number(process.env.EVENTS_PER_DAY || 50000));
 function cleanProps(p) {
