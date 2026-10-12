@@ -187,7 +187,7 @@ function logJob(data) {
 const EVENTOS_OK = new Set([
   'app_aberto', 'aba', 'midia', 'melhorar_foto', 'montagem', 'remontagem', 'ouvir_previa', 'locucao',
   'validacao_bloqueou', 'conferencia', 'gerar', 'pronto_salvar', 'pronto_compartilhar', 'pronto_fechar',
-  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro', 'legenda', 'legenda_post',
+  'rascunho_restaurado', 'rascunho_descartado', 'tipo_anuncio', 'estilo', 'formato', 'erro', 'legenda', 'legenda_post', 'cta',
 ]);
 const eventsLimiter = makeRateLimiter('events', Number(process.env.EVENTS_PER_IP_HOUR || 600), Number(process.env.EVENTS_PER_DAY || 50000));
 function cleanProps(p) {
@@ -349,7 +349,8 @@ const MONTAGEM_TTL = 60 * 60 * 1000;
 const MAX_MONTAGENS = 6;
 function montagemFiles(m) {
   return m.clips.map(function (c) { return c.path; })
-    .concat(m.voice ? [m.voice.cleanPath] : [], m.montagemPath ? [m.montagemPath] : []);
+    .concat(m.voice ? [m.voice.cleanPath] : [], m.montagemPath ? [m.montagemPath] : [], m.corePath ? [m.corePath] : [],
+      m.ctas && m.ctas.abre ? [m.ctas.abre.path] : [], m.ctas && m.ctas.fecha ? [m.ctas.fecha.path] : []);
 }
 function dropMontagem(id) {
   var m = MONTAGENS.get(id);
@@ -409,11 +410,12 @@ const uploadClips = multer({
     filename: function (req, file, cb) {
       var id = req.jobId || (req.jobId = crypto.randomUUID());
       if (file.fieldname === 'voice') return cb(null, 'sg-' + id + '-voice-raw');
+      if (file.fieldname === 'ctaAbre' || file.fieldname === 'ctaFecha') return cb(null, 'sg-' + id + '-' + file.fieldname + '-raw-' + Date.now().toString(36));
       var idx = req._clipCounter === undefined ? (req._clipCounter = 0) : ++req._clipCounter;
       cb(null, 'sg-' + id + '-clip' + idx + '.mp4');
     },
   }),
-  limits: { fileSize: 500 * 1024 * 1024, files: 11 },
+  limits: { fileSize: 500 * 1024 * 1024, files: 13 },
 });
 
 const uploadPhoto = multer({
@@ -634,6 +636,97 @@ async function prepareVoice(rawPath, jobId) {
 }
 
 // Versão leve (540x960) só pra prévia no celular: ~5x menor que o original.
+// ============================ CTA (vídeo do corretor) ============================
+// Vídeo de abertura e/ou de fechamento gravado pelo próprio corretor. A IA não
+// mexe: entra inteiro, antes e/ou depois da montagem, com o som original
+// (volume no mesmo padrão da locução). Até 40 segundos cada.
+const CTA_MAX_SEG = 40;
+async function hasAudioStream(filePath) {
+  var r = await runWithTimeout('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', filePath], 30 * 1000);
+  return /\d/.test(r.stdout || '');
+}
+// Normaliza um CTA pro mesmo formato da montagem (1080x1920, 30fps, yuv420p,
+// AAC 48k mono) e já em .ts, pronto pra emendar sem reprocessar.
+async function prepareCta(rawPath, jobId, nome) {
+  var dur = await probeDuration(rawPath);
+  if (!dur) return { error: 'Não consegui ler o vídeo de ' + nome + '. Tenta outro arquivo.' };
+  if (dur > CTA_MAX_SEG + 1.5) return { error: 'O vídeo de ' + nome + ' tem ' + Math.round(dur) + ' segundos. O limite é ' + CTA_MAX_SEG + '.' };
+  var outPath = tempName(jobId, 'cta-' + nome + '-' + Date.now().toString(36) + '.ts');
+  var comSom = await hasAudioStream(rawPath);
+  var vf = 'scale=' + W + ':' + H + ':force_original_aspect_ratio=increase,crop=' + W + ':' + H + ',setsar=1,fps=30,format=yuv420p';
+  var args = ['-y', '-i', rawPath];
+  if (!comSom) args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono');
+  args.push('-map', '0:v:0', '-map', comSom ? '0:a:0' : '1:a:0',
+    '-vf', vf,
+    '-af', comSom ? 'highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11,apad' : 'apad',
+    '-c:v', 'libx264', '-threads', ENCODE_THREADS, '-preset', 'veryfast', '-crf', '21',
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '1',
+    '-t', dur.toFixed(3), '-bsf:v', 'h264_mp4toannexb', '-f', 'mpegts', outPath);
+  var r = await runFfmpegWithTimeout(args, 4 * 60 * 1000);
+  if (r.code !== 0) {
+    console.error('[cta] falha preparando ' + nome + ', codigo', r.code, '| stderr:', r.stderrTail.slice(-800));
+    await cleanupPaths([outPath]);
+    return { error: 'Não consegui preparar o vídeo de ' + nome + '. Tenta outro arquivo.' };
+  }
+  return { path: outPath, duracao: Math.round(dur * 10) / 10 };
+}
+// Prepara os CTAs que vieram no upload (campos ctaAbre / ctaFecha).
+async function prepareCtasFromUpload(files, jobId, atual) {
+  var ctas = { abre: atual && atual.abre || null, fecha: atual && atual.fecha || null };
+  var pares = [['ctaAbre', 'abre', 'abertura'], ['ctaFecha', 'fecha', 'fechamento']];
+  for (var i = 0; i < pares.length; i++) {
+    var f = files && files[pares[i][0]] && files[pares[i][0]][0];
+    if (!f) continue;
+    var c = await prepareCta(f.path, jobId, pares[i][2]);
+    await cleanupPaths([f.path]);
+    if (c.error) return { error: c.error, ctas: ctas };
+    if (ctas[pares[i][1]]) await cleanupPaths([ctas[pares[i][1]].path]);
+    ctas[pares[i][1]] = c;
+  }
+  return { ctas: ctas };
+}
+// Emenda abertura + montagem + fechamento (só os que estiverem ligados).
+// A montagem ganha trilha muda se não tiver locução, pra todos os trechos
+// terem áudio igual. Sem CTA ligado, devolve a própria montagem.
+async function wrapWithCtas(corePath, ctas, usar, jobId) {
+  var abre = ctas && ctas.abre && usar && usar.abre ? ctas.abre : null;
+  var fecha = ctas && ctas.fecha && usar && usar.fecha ? ctas.fecha : null;
+  var outPath = tempName(jobId, 'com-cta-' + Date.now().toString(36) + '.mp4');
+  if (!abre && !fecha) {
+    await fsp.copyFile(corePath, outPath);
+    return { ok: true, outputPath: outPath, ctaSeg: { abre: 0, fecha: 0 } };
+  }
+  var coreTs = tempName(jobId, 'core-' + Date.now().toString(36) + '.ts');
+  var listPath = tempName(jobId, 'cta-list-' + Date.now().toString(36) + '.txt');
+  var vdur = await probeDuration(corePath);
+  var comSom = await hasAudioStream(corePath);
+  var args = ['-y', '-i', corePath];
+  if (!comSom) args.push('-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono');
+  args.push('-map', '0:v:0', '-map', comSom ? '0:a:0' : '1:a:0', '-c:v', 'copy', '-af', 'apad',
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '1');
+  if (vdur) args.push('-t', vdur.toFixed(3));
+  args.push('-bsf:v', 'h264_mp4toannexb', '-f', 'mpegts', coreTs);
+  var r = await runFfmpegWithTimeout(args, 2 * 60 * 1000);
+  if (r.code !== 0) {
+    console.error('[cta] falha preparando a montagem, codigo', r.code, '| stderr:', r.stderrTail.slice(-800));
+    await cleanupPaths([coreTs]);
+    return { ok: false, error: 'Não consegui juntar os vídeos de abertura/fechamento.' };
+  }
+  var partes = [abre && abre.path, coreTs, fecha && fecha.path].filter(Boolean);
+  await fsp.writeFile(listPath, partes.map(function (p) { return "file '" + p.replace(/'/g, "'\\''") + "'"; }).join('\n'));
+  var c = await runFfmpegWithTimeout(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart', outPath], 2 * 60 * 1000);
+  await cleanupPaths([coreTs, listPath]);
+  if (c.code !== 0) {
+    console.error('[cta] falha emendando, codigo', c.code, '| stderr:', c.stderrTail.slice(-800));
+    await cleanupPaths([outPath]);
+    return { ok: false, error: 'Não consegui juntar os vídeos de abertura/fechamento.' };
+  }
+  return { ok: true, outputPath: outPath, ctaSeg: { abre: abre ? abre.duracao : 0, fecha: fecha ? fecha.duracao : 0 } };
+}
+function parseUsar(body) {
+  return { abre: String(body && body.usarAbre) === '1', fecha: String(body && body.usarFecha) === '1' };
+}
+
 async function makePreview(inputPath, outPath) {
   var r = await runFfmpegWithTimeout(['-y', '-i', inputPath,
     '-vf', 'scale=540:960,format=yuv420p',
@@ -1323,10 +1416,26 @@ function buildPlanPayload(resumo, plano, fora, clips, voice, locucao, tokens, cu
 // guarda o vídeo montado, gera a prévia leve e manda pro celular
 async function finishMontagem(req, res, jobId, montagem, outputPath, planPayload, tag) {
   var stamp = Date.now().toString(36);
+  // outputPath = montagem da IA (sem CTA). Guarda ela pra poder trocar os
+  // CTAs depois sem chamar a IA de novo.
+  if (outputPath) {
+    var corePath = tempName(jobId, 'core-' + stamp + '.mp4');
+    await fsp.rename(outputPath, corePath);
+    if (montagem.corePath && montagem.corePath !== corePath) cleanupPaths([montagem.corePath]);
+    montagem.corePath = corePath;
+  }
+  var wrapped = await wrapWithCtas(montagem.corePath, montagem.ctas, montagem.usar, jobId);
+  if (!wrapped.ok) {
+    storeMontagem(jobId, montagem);
+    if (!res.headersSent) res.status(500).json({ error: wrapped.error });
+    return;
+  }
   var montagemPath = tempName(jobId, 'montagem-' + stamp + '.mp4');
-  await fsp.rename(outputPath, montagemPath);
+  await fsp.rename(wrapped.outputPath, montagemPath);
   if (montagem.montagemPath && montagem.montagemPath !== montagemPath) cleanupPaths([montagem.montagemPath]);
   montagem.montagemPath = montagemPath;
+  planPayload.cta = wrapped.ctaSeg;
+  planPayload.duracaoComCta = Math.round(((planPayload.duracaoFinal || 0) + wrapped.ctaSeg.abre + wrapped.ctaSeg.fecha) * 10) / 10;
   montagem.plan = planPayload;
   storeMontagem(jobId, montagem);
   var previewPath = tempName(jobId, 'preview-' + stamp + '.mp4');
@@ -1347,7 +1456,7 @@ async function finishMontagem(req, res, jobId, montagem, outputPath, planPayload
 app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
   if (!geminiKey()) return res.status(503).json({ error: 'Chave do Gemini não configurada no servidor.' });
   next();
-}, smartEditLimiter, uploadClips.fields([{ name: 'clips', maxCount: 10 }, { name: 'voice', maxCount: 1 }]), waitSlot, async function (req, res) {
+}, smartEditLimiter, uploadClips.fields([{ name: 'clips', maxCount: 10 }, { name: 'voice', maxCount: 1 }, { name: 'ctaAbre', maxCount: 1 }, { name: 'ctaFecha', maxCount: 1 }]), waitSlot, async function (req, res) {
   var t0 = Date.now();
   var clipFiles = (req.files && req.files.clips) || [];
   var voiceFile = req.files && req.files.voice && req.files.voice[0];
@@ -1356,8 +1465,11 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
   var voice = null;
   var contexto = { tipoImovel: cleanCtx(req.body && req.body.tipoImovel), anuncio: cleanCtx(req.body && req.body.anuncio), bairro: cleanCtx(req.body && req.body.bairro) };
   var jobInfo = { endpoint: 'montagem', clipes: clipFiles.length, mb: Math.round(clipFiles.reduce(function (s, f) { return s + f.size; }, 0) / 1048576), comVoz: !!voiceFile, anuncio: contexto.anuncio };
+  var ctaFiles = ['ctaAbre', 'ctaFecha'].map(function (k) { return req.files && req.files[k] && req.files[k][0]; }).filter(Boolean);
+  var ctasProntos = null;
   function cleanupInputs() {
-    var extra = voiceFile ? [voiceFile] : [];
+    var extra = (voiceFile ? [voiceFile] : []).concat(ctaFiles);
+    if (ctasProntos) cleanupPaths([ctasProntos.abre && ctasProntos.abre.path, ctasProntos.fecha && ctasProntos.fecha.path].filter(Boolean));
     return cleanupFiles(clipFiles.concat(extra)).then(function () {
       return cleanupPaths(proxyPaths.concat(voice && voice.cleanPath ? [voice.cleanPath, voice.aiPath] : []));
     });
@@ -1369,6 +1481,14 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
   if (clipFiles.length < 2) return fail(400, 'Manda pelo menos 2 vídeos.', 'poucos clipes');
 
   try {
+    // CTA (opcional): prepara antes da IA, pra avisar logo se tiver problema
+    if (ctaFiles.length) {
+      var pc = await prepareCtasFromUpload(req.files, jobId, null);
+      ctasProntos = pc.ctas;
+      if (pc.error) return fail(400, pc.error, 'cta');
+      jobInfo.cta = (ctasProntos.abre ? 'abre' : '') + (ctasProntos.fecha ? '+fecha' : '');
+    }
+
     // 0) locução (opcional): trata a voz e mede a duração
     if (voiceFile) {
       voice = await prepareVoice(voiceFile.path, jobId);
@@ -1445,7 +1565,10 @@ app.post('/autoedit/smart', requireSiteOrigin, function (req, res, next) {
       clips: clips.map(function (c) { return { path: c.path, duracao: c.duracao, nome: c.nome }; }),
       voice: voice ? { cleanPath: voice.cleanPath, alvo: voice.alvo, duracao: voice.duracao } : null,
       locucao: result.locucao,
+      ctas: ctasProntos || { abre: null, fecha: null },
+      usar: parseUsar(req.body),
     };
+    ctasProntos = null; // agora pertencem à montagem guardada
     await finishMontagem(req, res, jobId, montagem, out.outputPath, planPayload, 'smart');
   } catch (err) {
     if (err instanceof GeminiError) {
@@ -1503,6 +1626,35 @@ app.post('/autoedit/remontar', requireSiteOrigin, express.json({ limit: '32kb' }
     console.error('[remontar] erro inesperado:', err);
     logJob({ endpoint: 'remontar', ok: false, erro: 'inesperado', ms: Date.now() - t0 });
     if (!res.headersSent) res.status(500).json({ error: 'Não consegui refazer a montagem.' });
+  }
+});
+
+// ========================= /autoedit/cta/:id =========================
+// Troca, liga ou desliga os vídeos de abertura/fechamento de uma montagem
+// guardada. Não chama a IA: só emenda de novo.
+app.post('/autoedit/cta/:id', requireSiteOrigin, function (req, res, next) {
+  req.jobId = req.params.id;
+  next();
+}, uploadClips.fields([{ name: 'ctaAbre', maxCount: 1 }, { name: 'ctaFecha', maxCount: 1 }]), waitSlot, async function (req, res) {
+  var t0 = Date.now();
+  var id = req.params.id;
+  var m = getMontagem(id);
+  var files = ['ctaAbre', 'ctaFecha'].map(function (k) { return req.files && req.files[k] && req.files[k][0]; }).filter(Boolean);
+  if (!m || !m.corePath) { await cleanupFiles(files); return res.status(410).json({ error: MONTAGEM_EXPIRADA }); }
+  try {
+    var pc = await prepareCtasFromUpload(req.files, id, m.ctas);
+    m.ctas = pc.ctas;
+    if (pc.error) { logJob({ endpoint: 'cta', ok: false, erro: pc.error, ms: Date.now() - t0 }); return res.status(400).json({ error: pc.error }); }
+    m.usar = parseUsar(req.body);
+    if (m.usar.abre && !m.ctas.abre) return res.status(409).json({ error: 'precisa_reenviar', falta: 'abre' });
+    if (m.usar.fecha && !m.ctas.fecha) return res.status(409).json({ error: 'precisa_reenviar', falta: 'fecha' });
+    var plan = Object.assign({}, m.plan);
+    logJob({ endpoint: 'cta', ok: true, ms: Date.now() - t0, cta: (m.usar.abre ? 'abre' : '') + (m.usar.fecha ? '+fecha' : '') });
+    await finishMontagem(req, res, id, m, null, plan, 'cta');
+  } catch (err) {
+    console.error('[cta] erro inesperado:', err);
+    await cleanupFiles(files);
+    if (!res.headersSent) res.status(500).json({ error: 'Não consegui aplicar os vídeos de abertura/fechamento.' });
   }
 });
 
