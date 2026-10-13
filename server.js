@@ -202,6 +202,52 @@ function cleanProps(p) {
   });
   return out;
 }
+// Nome legível do aparelho a partir do navegador (sem nada pessoal):
+// "Samsung Galaxy S23 · Android 15 · Chrome", "iPhone · iOS 18 · Safari".
+// O iPhone não informa qual modelo é.
+var SAMSUNG = { 'S901': 'Galaxy S22', 'S906': 'Galaxy S22+', 'S908': 'Galaxy S22 Ultra', 'S911': 'Galaxy S23', 'S916': 'Galaxy S23+', 'S918': 'Galaxy S23 Ultra', 'S711': 'Galaxy S23 FE',
+  'S921': 'Galaxy S24', 'S926': 'Galaxy S24+', 'S928': 'Galaxy S24 Ultra', 'S721': 'Galaxy S24 FE', 'S931': 'Galaxy S25', 'S936': 'Galaxy S25+', 'S938': 'Galaxy S25 Ultra',
+  'G991': 'Galaxy S21', 'G996': 'Galaxy S21+', 'G998': 'Galaxy S21 Ultra', 'G990': 'Galaxy S21 FE', 'A546': 'Galaxy A54', 'A556': 'Galaxy A55', 'A566': 'Galaxy A56', 'A536': 'Galaxy A53',
+  'A346': 'Galaxy A34', 'A356': 'Galaxy A35', 'A366': 'Galaxy A36', 'A256': 'Galaxy A25', 'A266': 'Galaxy A26', 'A245': 'Galaxy A24', 'A155': 'Galaxy A15', 'A156': 'Galaxy A15 5G', 'A165': 'Galaxy A16', 'A166': 'Galaxy A16 5G',
+  'A145': 'Galaxy A14', 'A146': 'Galaxy A14 5G', 'A135': 'Galaxy A13', 'A057': 'Galaxy A05s', 'A055': 'Galaxy A05', 'A525': 'Galaxy A52', 'A325': 'Galaxy A32', 'A515': 'Galaxy A51',
+  'M546': 'Galaxy M54', 'M346': 'Galaxy M34', 'M156': 'Galaxy M15', 'F936': 'Galaxy Z Fold4', 'F946': 'Galaxy Z Fold5', 'F956': 'Galaxy Z Fold6', 'F721': 'Galaxy Z Flip4', 'F731': 'Galaxy Z Flip5', 'F741': 'Galaxy Z Flip6' };
+function modeloAmigavel(m) {
+  m = String(m || '').trim().replace(/^SAMSUNG\s+/i, '');
+  var sm = m.match(/^SM-([A-Z]\d{3})/i);
+  if (sm) return 'Samsung ' + (SAMSUNG[sm[1].toUpperCase()] || m);
+  return m;
+}
+function aparelhoNome(ua, hw, dev) {
+  ua = String(ua || '');
+  var so = '', modelo = '', nav = '', m;
+  if ((m = ua.match(/iPhone OS (\d+)/))) { modelo = 'iPhone'; so = 'iOS ' + m[1]; }
+  else if ((m = ua.match(/iPad.*? OS (\d+)/))) { modelo = 'iPad'; so = 'iPadOS ' + m[1]; }
+  else if ((m = ua.match(/Android (\d+)[^;)]*;\s*([^;)]*?)(?:\s+Build\/[^;)]*)?\)/))) { so = 'Android ' + m[1]; if (m[2] && m[2] !== 'K' && m[2] !== 'wv') modelo = m[2]; }
+  else if (/Android/.test(ua)) so = 'Android';
+  else if (/Windows NT/.test(ua)) so = 'Windows';
+  else if (/Macintosh/.test(ua)) { if (dev === 'mobile') { modelo = 'iPad'; so = 'iPadOS'; } else so = 'Mac'; }
+  else if (/CrOS/.test(ua)) so = 'Chromebook';
+  else if (/Linux/.test(ua)) so = 'Linux';
+  if (hw && typeof hw === 'object') {
+    if (hw.m) modelo = String(hw.m).slice(0, 40);
+    var pv = parseInt(hw.pv, 10);
+    if (/android/i.test(hw.pl) && pv) so = 'Android ' + pv;
+    else if (/windows/i.test(hw.pl) && isFinite(pv)) so = pv >= 13 ? 'Windows 11' : 'Windows 10';
+    else if (/mac/i.test(hw.pl) && pv) so = 'macOS ' + pv;
+  }
+  if (/Instagram/.test(ua)) nav = 'app do Instagram';
+  else if (/FBAN|FBAV/.test(ua)) nav = 'app do Facebook';
+  else if (/SamsungBrowser/.test(ua)) nav = 'Samsung Internet';
+  else if (/EdgA|EdgiOS|Edg\//.test(ua)) nav = 'Edge';
+  else if (/OPR\/|OPiOS/.test(ua)) nav = 'Opera';
+  else if (/FxiOS|Firefox/.test(ua)) nav = 'Firefox';
+  else if (/CriOS|Chrome\//.test(ua)) nav = 'Chrome';
+  else if (/Safari/.test(ua)) nav = 'Safari';
+  var cabeca = modeloAmigavel(modelo);
+  if (!cabeca && !(dev !== 'mobile' && so)) cabeca = dev === 'mobile' ? 'Celular' : 'Computador';
+  return [cabeca, so, nav].filter(Boolean).join(' · ').slice(0, 90);
+}
+
 app.post('/events', requireSiteOrigin, eventsLimiter, express.text({ type: '*/*', limit: '32kb' }), function (req, res) {
   var body;
   try { body = JSON.parse(req.body || '{}'); } catch (e) { return res.status(400).end(); }
@@ -210,9 +256,10 @@ app.post('/events', requireSiteOrigin, eventsLimiter, express.text({ type: '*/*'
   var dev = body.dev === 'mobile' ? 'mobile' : 'desktop';
   var evs = Array.isArray(body.ev) ? body.ev.slice(0, 40) : [];
   var now = new Date().toISOString();
+  var ap = aparelhoNome(req.headers['user-agent'], body.hw, dev);
   evs.forEach(function (x) {
     if (!x || !EVENTOS_OK.has(x.e)) return;
-    appendEvent({ t: now, tipo: 'ev', d: d, s: sid, dev: dev, e: x.e, p: cleanProps(x.p) });
+    appendEvent({ t: now, tipo: 'ev', d: d, s: sid, dev: dev, ap: ap, e: x.e, p: cleanProps(x.p) });
   });
   res.status(204).end();
 });
@@ -356,19 +403,29 @@ function calcularUso(dias) {
   var desde = Date.now() - dias * 86400000;
   var evs = lerEventos(desde).filter(function (o) { return o.tipo === 'ev' && o.s; });
   evs.sort(function (a, b) { return Date.parse(a.t) - Date.parse(b.t); });
-  var nomes = {}, cont = { mobile: 0, desktop: 0 }, aparelhos = {};
+  // nome de cada aparelho: o mais recente informado pelo navegador; se dois
+  // aparelhos tiverem o mesmo nome, ganham (2), (3)…
+  var rotulo = {}, cont = { mobile: 0, desktop: 0 };
+  evs.forEach(function (o) { if (o.d && o.ap) rotulo[o.d] = o.ap; });
+  var nomes = {}, usados = {};
+  evs.forEach(function (o) {
+    if (!o.d || nomes[o.d]) return;
+    var base = rotulo[o.d] || ((o.dev === 'mobile' ? 'Celular ' : 'Computador ') + (++cont[o.dev]));
+    usados[base] = (usados[base] || 0) + 1;
+    nomes[o.d] = usados[base] > 1 ? base + ' (' + usados[base] + ')' : base;
+  });
+  var aparelhos = {};
   var sessoes = {};
   evs.forEach(function (o) {
-    if (o.d && !nomes[o.d]) { cont[o.dev]++; nomes[o.d] = (o.dev === 'mobile' ? 'Celular ' : 'Computador ') + cont[o.dev]; }
     var nome = nomes[o.d] || (o.dev === 'mobile' ? 'Celular' : 'Computador');
-    var ap = aparelhos[nome] || (aparelhos[nome] = { nome: nome, primeiro: o.t, ultimo: o.t, sessoes: new Set(), pecas: 0, dias: new Set() });
+    var ap = aparelhos[nome] || (aparelhos[nome] = { nome: nome, primeiro: o.t, ultimo: o.t, sessoes: new Set(), pecas: 0, dias: new Set(), c: {}, anuncios: {} });
     ap.ultimo = o.t; ap.sessoes.add(o.s);
     ap.dias.add(new Date(o.t).toLocaleDateString('pt-BR', { timeZone: FUSO }));
     var s = sessoes[o.s] || (sessoes[o.s] = { inicio: o.t, fim: o.t, aparelho: nome, c: {}, anuncios: {}, erros: [] });
     s.fim = o.t;
     var p = o.p || {};
-    function add(k) { s.c[k] = (s.c[k] || 0) + 1; }
-    if (o.e === 'gerar' && p.ok) { add('gerou_' + p.tipo); ap.pecas++; if (p.anuncio) s.anuncios[ANUNCIO_NOME[p.anuncio] || p.anuncio] = 1; }
+    function add(k) { s.c[k] = (s.c[k] || 0) + 1; ap.c[k] = (ap.c[k] || 0) + 1; }
+    if (o.e === 'gerar' && p.ok) { add('gerou_' + p.tipo); ap.pecas++; if (p.anuncio) { var an = ANUNCIO_NOME[p.anuncio] || p.anuncio; s.anuncios[an] = 1; ap.anuncios[an] = (ap.anuncios[an] || 0) + 1; } }
     else if (o.e === 'gerar') add('falhou');
     else if (o.e === 'melhorar_foto' && p.ok) add('foto_ia');
     else if (o.e === 'montagem' && p.ok) { add('montagem_ia'); if (p.voz) add('com_locucao'); }
@@ -411,7 +468,7 @@ function calcularUso(dias) {
     diasComUso: diasComUso,
     sessoesComPeca: lista.filter(function (x) { return x.gerou; }).length,
     sessoes: lista.slice(0, 60),
-    aparelhos: Object.keys(aparelhos).map(function (k) { var a = aparelhos[k]; return { nome: a.nome, primeiro: a.primeiro, ultimo: a.ultimo, sessoes: a.sessoes.size, pecas: a.pecas, dias: a.dias.size }; })
+    aparelhos: Object.keys(aparelhos).map(function (k) { var a = aparelhos[k]; return { nome: a.nome, primeiro: a.primeiro, ultimo: a.ultimo, sessoes: a.sessoes.size, pecas: a.pecas, dias: a.dias.size, c: a.c, anuncios: a.anuncios }; })
       .sort(function (a, b) { return Date.parse(b.ultimo) - Date.parse(a.ultimo); }),
   };
 }
@@ -452,6 +509,7 @@ app.get('/painel', function (req, res) {
     'body{margin:0;background:var(--bg);color:var(--i);font:15px/1.5 system-ui,-apple-system,sans-serif}.w{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{font:600 28px Georgia,serif;margin:0 0 4px}h2{font:600 19px Georgia,serif;margin:28px 0 10px}.mut{color:var(--m)}' +
     '.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.c{background:var(--s);border:1px solid var(--l);border-radius:12px;padding:14px}.n{font:600 30px Georgia,serif;font-variant-numeric:tabular-nums}.l{font-size:13px;color:var(--m)}' +
     '.bar{display:grid;grid-template-columns:200px 1fr 60px;gap:10px;align-items:center;margin:6px 0}.bar div.t{height:14px;border-radius:7px;background:var(--g)}.tw{overflow-x:auto;background:var(--s);border:1px solid var(--l);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:480px;font-variant-numeric:tabular-nums}td,th{padding:8px 12px;border-bottom:1px solid var(--l);text-align:left}th{font-size:12px;color:var(--m);text-transform:uppercase}.av{background:#FBF0D9;color:#6b4700;padding:10px 14px;border-radius:10px;margin:14px 0}' +
+    '.aps{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}.ap{background:var(--s);border:1px solid var(--l);border-radius:12px;padding:14px}.apn{font:600 18px Georgia,serif;margin-bottom:2px}.ap ul{margin:10px 0 0;padding-left:18px}.ap li{margin:2px 0}' +
     '.log{background:var(--s);border:1px solid var(--l);border-radius:12px}.log .it{padding:11px 14px;border-bottom:1px solid var(--l);display:flex;flex-direction:column;gap:2px}.log .it:last-child{border-bottom:0}.log .q{font-size:14px;color:var(--m);font-variant-numeric:tabular-nums}.log .q b{color:var(--i)}.log .sem{color:var(--m)}.tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:9px;border:1px solid var(--l);color:var(--m)}.err{color:var(--r);font-size:13px}' +
     '@media(max-width:560px){.bar{grid-template-columns:1fr 50px}.bar span.lb{grid-column:1/-1}}</style></head><body><div class="w">' +
     '<h1>Painel do Studio Giovani</h1><div class="mut">Últimos ' + dias + ' dias · <a href="/painel?dias=7">7 dias</a> · <a href="/painel?dias=30">30 dias</a> · <a href="/painel?dias=90">90 dias</a> · <a href="/painel/sair">Sair</a></div>' +
@@ -462,9 +520,29 @@ app.get('/painel', function (req, res) {
     '<div class="c"><div class="n">' + uso.diasComUso + '</div><div class="l">dias com uso, de ' + dias + '</div></div>' +
     '<div class="c"><div class="n">' + uso.sessoesComPeca + '</div><div class="l">visitas em que gerou alguma peça, de ' + uso.sessoes.length + '</div></div>' +
     '</div>' +
-    '<h2>Aparelhos</h2><p class="mut" style="margin:-4px 0 10px">Cada celular ou computador ganha um nome na ordem em que apareceu. Os seus testes também entram aqui.</p><div class="tw"><table><tr><th>Aparelho</th><th>Primeiro uso</th><th>Último uso</th><th>Dias</th><th>Visitas</th><th>Peças</th></tr>' +
-    (uso.aparelhos.length ? uso.aparelhos.map(function (a) { return '<tr><td><b>' + esc(a.nome) + '</b></td><td>' + quando(a.primeiro) + '</td><td>' + quando(a.ultimo) + '</td><td>' + a.dias + '</td><td>' + a.sessoes + '</td><td>' + a.pecas + '</td></tr>'; }).join('') : '<tr><td colspan="6" class="mut">ninguém usou neste período</td></tr>') +
-    '</table></div>' +
+    '<h2>O que cada aparelho fez</h2><p class="mut" style="margin:-4px 0 10px">O nome vem do próprio navegador (modelo, sistema e navegador). O iPhone não informa qual modelo é. Os seus testes também aparecem aqui.</p><div class="aps">' +
+    (uso.aparelhos.length ? uso.aparelhos.map(function (a) {
+      var c = a.c, it = [];
+      function li(n, um, varios, extra) { if (n) it.push('<li><b>' + n + '</b> ' + (n === 1 ? um : varios) + (extra || '') + '</li>'); }
+      li(c.gerou_video, 'vídeo gerado com a arte', 'vídeos gerados com a arte');
+      li(c.gerou_montagem, 'montagem gerada com a arte', 'montagens geradas com a arte');
+      li(c.gerou_foto, 'foto gerada com a arte', 'fotos geradas com a arte');
+      li(c.montagem_ia, 'montagem feita pela IA', 'montagens feitas pela IA', c.com_locucao ? ' (' + c.com_locucao + ' com locução)' : '');
+      li(c.ajuste, 'ajuste manual na montagem', 'ajustes manuais na montagem');
+      li(c.foto_ia, 'foto melhorada com IA', 'fotos melhoradas com IA');
+      li(c.legenda, 'legenda gerada no vídeo', 'legendas geradas no vídeo');
+      li(c.cta, 'vídeo de abertura/fechamento escolhido', 'vídeos de abertura/fechamento escolhidos');
+      li(c.copiou_legenda, 'legenda do post copiada', 'legendas do post copiadas');
+      li(c.salvou, 'vez que salvou no aparelho', 'vezes que salvou no aparelho');
+      li(c.compartilhou, 'vez que compartilhou', 'vezes que compartilhou');
+      li(c.falhou, 'tentativa de gerar que falhou', 'tentativas de gerar que falharam');
+      li(c.erro, 'erro', 'erros');
+      var an = Object.keys(a.anuncios);
+      return '<div class="ap"><div class="apn">' + esc(a.nome) + '</div><div class="mut" style="font-size:14px">Último uso ' + quando(a.ultimo) + ' (' + haQuanto(a.ultimo) + ') · primeiro uso ' + quando(a.primeiro) + '<br>' + a.sessoes + (a.sessoes === 1 ? ' visita' : ' visitas') + ' em ' + a.dias + (a.dias === 1 ? ' dia' : ' dias') + '</div>' +
+        (it.length ? '<ul>' + it.join('') + '</ul>' : '<p class="mut" style="margin:8px 0 0">Abriu o Studio, mas não gerou nada.</p>') +
+        (an.length ? '<div style="margin-top:6px">' + an.map(function (k) { return '<span class="tag">' + esc(k) + ': ' + a.anuncios[k] + '</span>'; }).join(' ') + '</div>' : '') + '</div>';
+    }).join('') : '<div class="ap mut">ninguém usou neste período</div>') +
+    '</div>' +
     '<h2>Registro de uso</h2><p class="mut" style="margin:-4px 0 10px">Cada linha é uma visita ao Studio, da mais recente para a mais antiga.</p><div class="log">' +
     (uso.sessoes.length ? uso.sessoes.map(function (x) {
       return '<div class="it' + (x.gerou ? '' : ' sem') + '"><div class="q"><b>' + quando(x.inicio) + '</b> · ' + esc(x.aparelho) + ' · ' + x.minutos + ' min</div><div>' + esc(x.resumo) +
