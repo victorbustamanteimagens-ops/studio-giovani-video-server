@@ -299,12 +299,150 @@ function calcularMetricas(dias) {
 
 function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 
+// ---------------------- painel: senha + registro de uso ----------------------
+// Entra com a senha (a mesma do ADMIN_TOKEN, sem diferença de maiúscula e
+// minúscula) e fica logado 30 dias neste navegador (cookie só do servidor).
+function senhaPainelOk(given) {
+  var want = (process.env.ADMIN_TOKEN || '').trim().toLowerCase();
+  if (!want || !given) return false;
+  var a = crypto.createHash('sha256').update(String(given).trim().toLowerCase()).digest();
+  var b = crypto.createHash('sha256').update(want).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+function painelCookie() {
+  return crypto.createHmac('sha256', (process.env.ADMIN_TOKEN || '').trim().toLowerCase()).update('painel-v1').digest('hex');
+}
+function painelAutorizado(req) {
+  if (tokenOk(req.query.token)) return true;
+  var m = String(req.headers.cookie || '').match(/(?:^|;\s*)sg_painel=([a-f0-9]{64})/);
+  if (!m) return false;
+  var a = Buffer.from(m[1]), b = Buffer.from(painelCookie());
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+var painelTentativas = new Map();
+function painelLoginHtml(erro) {
+  return '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Entrar · Painel Studio Giovani</title><style>' +
+    ':root{--bg:#F5F3EE;--s:#fff;--i:#1C1B18;--m:#5E584C;--l:#DDD5C4;--g:#C9A24D;--gt:#1C1B18;--r:#B3261E}@media(prefers-color-scheme:dark){:root{--bg:#141517;--s:#1D1D1B;--i:#F1EFE9;--m:#B3AC9C;--l:#39352C;--g:#D8B15C;--gt:#17181A;--r:#F08A7A}}' +
+    'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--i);font:16px/1.5 system-ui,-apple-system,sans-serif;padding:16px;box-sizing:border-box}' +
+    'form{width:100%;max-width:360px;background:var(--s);border:1px solid var(--l);border-radius:14px;padding:26px 22px;display:flex;flex-direction:column;gap:14px}h1{font:600 24px Georgia,serif;margin:0}p{margin:0;color:var(--m);font-size:15px}' +
+    'label{font-weight:600;font-size:15px}input{font:inherit;font-size:17px;min-height:48px;padding:10px 12px;border-radius:10px;border:1px solid var(--l);background:var(--bg);color:var(--i)}input:focus-visible,button:focus-visible{outline:2px solid var(--g);outline-offset:2px}' +
+    'button{font:inherit;font-weight:700;font-size:17px;min-height:50px;border:0;border-radius:10px;background:var(--g);color:var(--gt);cursor:pointer}.e{color:var(--r);font-weight:600}</style></head><body>' +
+    '<form method="post" action="/painel/entrar"><h1>Painel do Studio</h1><p>Uso do Studio Giovani: quem abriu, quando e o que gerou.</p>' +
+    (erro ? '<p class="e" role="alert">' + esc(erro) + '</p>' : '') +
+    '<label for="senha">Senha</label><input id="senha" name="senha" type="password" autocomplete="current-password" required autofocus><button type="submit">Entrar</button></form></body></html>';
+}
+
+var FUSO = 'America/Sao_Paulo';
+function quando(t) {
+  var d = new Date(t);
+  var dia = d.toLocaleDateString('pt-BR', { timeZone: FUSO, day: '2-digit', month: '2-digit' });
+  var hoje = new Date().toLocaleDateString('pt-BR', { timeZone: FUSO, day: '2-digit', month: '2-digit' });
+  var ontem = new Date(Date.now() - 86400000).toLocaleDateString('pt-BR', { timeZone: FUSO, day: '2-digit', month: '2-digit' });
+  var hora = d.toLocaleTimeString('pt-BR', { timeZone: FUSO, hour: '2-digit', minute: '2-digit' });
+  return (dia === hoje ? 'hoje' : dia === ontem ? 'ontem' : dia) + ' às ' + hora;
+}
+function haQuanto(t) {
+  var min = Math.round((Date.now() - Date.parse(t)) / 60000);
+  if (min < 2) return 'agora há pouco';
+  if (min < 60) return 'há ' + min + ' min';
+  var h = Math.round(min / 60);
+  if (h < 24) return 'há ' + h + (h === 1 ? ' hora' : ' horas');
+  var d = Math.round(h / 24);
+  return 'há ' + d + (d === 1 ? ' dia' : ' dias');
+}
+var ANUNCIO_NOME = { venda: 'à venda', aluguel: 'aluguel', vendido: 'vendido', comercial: 'comercial' };
+// Junta os eventos em sessões (cada visita ao site) com um resumo em português.
+function calcularUso(dias) {
+  var desde = Date.now() - dias * 86400000;
+  var evs = lerEventos(desde).filter(function (o) { return o.tipo === 'ev' && o.s; });
+  evs.sort(function (a, b) { return Date.parse(a.t) - Date.parse(b.t); });
+  var nomes = {}, cont = { mobile: 0, desktop: 0 }, aparelhos = {};
+  var sessoes = {};
+  evs.forEach(function (o) {
+    if (o.d && !nomes[o.d]) { cont[o.dev]++; nomes[o.d] = (o.dev === 'mobile' ? 'Celular ' : 'Computador ') + cont[o.dev]; }
+    var nome = nomes[o.d] || (o.dev === 'mobile' ? 'Celular' : 'Computador');
+    var ap = aparelhos[nome] || (aparelhos[nome] = { nome: nome, primeiro: o.t, ultimo: o.t, sessoes: new Set(), pecas: 0, dias: new Set() });
+    ap.ultimo = o.t; ap.sessoes.add(o.s);
+    ap.dias.add(new Date(o.t).toLocaleDateString('pt-BR', { timeZone: FUSO }));
+    var s = sessoes[o.s] || (sessoes[o.s] = { inicio: o.t, fim: o.t, aparelho: nome, c: {}, anuncios: {}, erros: [] });
+    s.fim = o.t;
+    var p = o.p || {};
+    function add(k) { s.c[k] = (s.c[k] || 0) + 1; }
+    if (o.e === 'gerar' && p.ok) { add('gerou_' + p.tipo); ap.pecas++; if (p.anuncio) s.anuncios[ANUNCIO_NOME[p.anuncio] || p.anuncio] = 1; }
+    else if (o.e === 'gerar') add('falhou');
+    else if (o.e === 'melhorar_foto' && p.ok) add('foto_ia');
+    else if (o.e === 'montagem' && p.ok) { add('montagem_ia'); if (p.voz) add('com_locucao'); }
+    else if (o.e === 'remontagem' && p.ok) add('ajuste');
+    else if (o.e === 'legenda' && p.ok) add('legenda');
+    else if (o.e === 'legenda_post' && p.acao === 'copiar') add('copiou_legenda');
+    else if (o.e === 'cta' && p.acao === 'escolher') add('cta');
+    else if (o.e === 'pronto_salvar') add('salvou');
+    else if (o.e === 'pronto_compartilhar' && p.ok) add('compartilhou');
+    else if (o.e === 'erro') { add('erro'); if (s.erros.length < 3 && p.msg) s.erros.push(p.msg); }
+  });
+  function plural(n, um, varios) { return n + ' ' + (n === 1 ? um : varios); }
+  var lista = Object.keys(sessoes).map(function (k) {
+    var s = sessoes[k], c = s.c, partes = [];
+    if (c.gerou_video) partes.push(plural(c.gerou_video, 'vídeo gerado', 'vídeos gerados'));
+    if (c.gerou_montagem) partes.push(plural(c.gerou_montagem, 'montagem gerada', 'montagens geradas'));
+    if (c.gerou_foto) partes.push(plural(c.gerou_foto, 'foto gerada', 'fotos geradas'));
+    if (c.montagem_ia) partes.push(plural(c.montagem_ia, 'montagem com IA', 'montagens com IA') + (c.com_locucao ? ' (com locução)' : ''));
+    if (c.foto_ia) partes.push(plural(c.foto_ia, 'foto melhorada com IA', 'fotos melhoradas com IA'));
+    if (c.ajuste) partes.push(plural(c.ajuste, 'ajuste na montagem', 'ajustes na montagem'));
+    if (c.legenda) partes.push(plural(c.legenda, 'legenda no vídeo', 'legendas no vídeo'));
+    if (c.cta) partes.push('escolheu vídeo de abertura/fechamento');
+    if (c.copiou_legenda) partes.push('copiou a legenda do post');
+    if (c.salvou || c.compartilhou) partes.push((c.salvou ? 'salvou' : '') + (c.salvou && c.compartilhou ? ' e ' : '') + (c.compartilhou ? 'compartilhou' : ''));
+    var gerou = !!(c.gerou_video || c.gerou_montagem || c.gerou_foto);
+    var min = Math.max(1, Math.round((Date.parse(s.fim) - Date.parse(s.inicio)) / 60000));
+    return {
+      inicio: s.inicio, aparelho: s.aparelho, minutos: min, gerou: gerou,
+      resumo: partes.length ? partes.join(' · ') : 'Abriu e saiu sem gerar nada',
+      anuncios: Object.keys(s.anuncios), erros: c.erro ? s.erros.length ? s.erros : ['erro'] : [], nErros: c.erro || 0,
+    };
+  }).sort(function (a, b) { return Date.parse(b.inicio) - Date.parse(a.inicio); });
+  var ult = evs.length ? evs[evs.length - 1] : null;
+  var ultPeca = null;
+  for (var i = evs.length - 1; i >= 0; i--) { if (evs[i].e === 'gerar' && evs[i].p && evs[i].p.ok) { ultPeca = evs[i]; break; } }
+  var diasComUso = new Set(evs.map(function (o) { return new Date(o.t).toLocaleDateString('pt-BR', { timeZone: FUSO }); })).size;
+  return {
+    ultimo: ult ? { t: ult.t, aparelho: nomes[ult.d] || '' } : null,
+    ultimaPeca: ultPeca ? { t: ultPeca.t, aparelho: nomes[ultPeca.d] || '', tipo: ultPeca.p.tipo } : null,
+    diasComUso: diasComUso,
+    sessoesComPeca: lista.filter(function (x) { return x.gerou; }).length,
+    sessoes: lista.slice(0, 60),
+    aparelhos: Object.keys(aparelhos).map(function (k) { var a = aparelhos[k]; return { nome: a.nome, primeiro: a.primeiro, ultimo: a.ultimo, sessoes: a.sessoes.size, pecas: a.pecas, dias: a.dias.size }; })
+      .sort(function (a, b) { return Date.parse(b.ultimo) - Date.parse(a.ultimo); }),
+  };
+}
+
+app.post('/painel/entrar', express.urlencoded({ extended: false, limit: '4kb' }), function (req, res) {
+  if (!(process.env.ADMIN_TOKEN || '').trim()) return res.status(503).type('text/plain').send('Painel desligado: defina a variável ADMIN_TOKEN no Railway.');
+  var ip = req.ip || 'x', agora = Date.now();
+  var tt = (painelTentativas.get(ip) || []).filter(function (t) { return agora - t < 15 * 60000; });
+  if (tt.length >= 10) return res.status(429).type('html').send(painelLoginHtml('Muitas tentativas. Espere 15 minutos.'));
+  if (!senhaPainelOk(req.body && req.body.senha)) {
+    tt.push(agora); painelTentativas.set(ip, tt);
+    return res.status(401).type('html').send(painelLoginHtml('Senha errada. Tente de novo.'));
+  }
+  painelTentativas.delete(ip);
+  var secure = (req.headers['x-forwarded-proto'] || req.protocol) === 'https' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', 'sg_painel=' + painelCookie() + '; Path=/painel; HttpOnly; SameSite=Lax; Max-Age=2592000' + secure);
+  res.redirect(303, '/painel');
+});
+app.get('/painel/sair', function (req, res) {
+  res.setHeader('Set-Cookie', 'sg_painel=; Path=/painel; HttpOnly; SameSite=Lax; Max-Age=0');
+  res.redirect(303, '/painel');
+});
+
 app.get('/painel', function (req, res) {
   if (!(process.env.ADMIN_TOKEN || '').trim()) return res.status(503).type('text/plain').send('Painel desligado: defina a variável ADMIN_TOKEN no Railway.');
-  if (!tokenOk(req.query.token)) return res.status(401).type('text/plain').send('Acesso negado.');
+  res.setHeader('Cache-Control', 'no-store');
+  if (!painelAutorizado(req)) return res.type('html').send(painelLoginHtml(''));
   var dias = Math.min(180, Math.max(1, Number(req.query.dias) || 30));
   var m = calcularMetricas(dias);
-  if (req.query.formato === 'json') return res.json(m);
+  var uso = calcularUso(dias);
+  if (req.query.formato === 'json') return res.json(Object.assign({}, m, { uso: uso }));
   var usd = function (v) { return 'US$ ' + v.toFixed(2).replace('.', ','); };
   var maxF = Math.max(1, m.funil[0][1]);
   var custoTotal = m.foto.custoUSD + m.montagem.custoUSD;
@@ -314,10 +452,28 @@ app.get('/painel', function (req, res) {
     'body{margin:0;background:var(--bg);color:var(--i);font:15px/1.5 system-ui,-apple-system,sans-serif}.w{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{font:600 28px Georgia,serif;margin:0 0 4px}h2{font:600 19px Georgia,serif;margin:28px 0 10px}.mut{color:var(--m)}' +
     '.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.c{background:var(--s);border:1px solid var(--l);border-radius:12px;padding:14px}.n{font:600 30px Georgia,serif;font-variant-numeric:tabular-nums}.l{font-size:13px;color:var(--m)}' +
     '.bar{display:grid;grid-template-columns:200px 1fr 60px;gap:10px;align-items:center;margin:6px 0}.bar div.t{height:14px;border-radius:7px;background:var(--g)}.tw{overflow-x:auto;background:var(--s);border:1px solid var(--l);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:480px;font-variant-numeric:tabular-nums}td,th{padding:8px 12px;border-bottom:1px solid var(--l);text-align:left}th{font-size:12px;color:var(--m);text-transform:uppercase}.av{background:#FBF0D9;color:#6b4700;padding:10px 14px;border-radius:10px;margin:14px 0}' +
+    '.log{background:var(--s);border:1px solid var(--l);border-radius:12px}.log .it{padding:11px 14px;border-bottom:1px solid var(--l);display:flex;flex-direction:column;gap:2px}.log .it:last-child{border-bottom:0}.log .q{font-size:14px;color:var(--m);font-variant-numeric:tabular-nums}.log .q b{color:var(--i)}.log .sem{color:var(--m)}.tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:9px;border:1px solid var(--l);color:var(--m)}.err{color:var(--r);font-size:13px}' +
     '@media(max-width:560px){.bar{grid-template-columns:1fr 50px}.bar span.lb{grid-column:1/-1}}</style></head><body><div class="w">' +
-    '<h1>Painel do Studio Giovani</h1><div class="mut">Últimos ' + dias + ' dias · <a href="?token=' + esc(req.query.token) + '&dias=7">7 dias</a> · <a href="?token=' + esc(req.query.token) + '&dias=30">30 dias</a> · <a href="?token=' + esc(req.query.token) + '&dias=90">90 dias</a></div>' +
+    '<h1>Painel do Studio Giovani</h1><div class="mut">Últimos ' + dias + ' dias · <a href="/painel?dias=7">7 dias</a> · <a href="/painel?dias=30">30 dias</a> · <a href="/painel?dias=90">90 dias</a> · <a href="/painel/sair">Sair</a></div>' +
     (m.persistente ? '' : '<div class="av"><b>Atenção:</b> sem Volume no Railway, estes dados zeram a cada publicação do servidor.</div>') +
-    '<div class="g" style="margin-top:16px">' +
+    '<h2>Está usando?</h2><div class="g">' +
+    '<div class="c"><div class="n" style="font-size:24px">' + (uso.ultimo ? haQuanto(uso.ultimo.t) : '—') + '</div><div class="l">último acesso' + (uso.ultimo ? ' · ' + quando(uso.ultimo.t) + ' · ' + esc(uso.ultimo.aparelho) : ', nenhum ainda') + '</div></div>' +
+    '<div class="c"><div class="n" style="font-size:24px">' + (uso.ultimaPeca ? haQuanto(uso.ultimaPeca.t) : '—') + '</div><div class="l">última peça gerada' + (uso.ultimaPeca ? ' (' + ({ video: 'vídeo', foto: 'foto', montagem: 'montagem' }[uso.ultimaPeca.tipo] || 'peça') + ') · ' + quando(uso.ultimaPeca.t) : ', nenhuma ainda') + '</div></div>' +
+    '<div class="c"><div class="n">' + uso.diasComUso + '</div><div class="l">dias com uso, de ' + dias + '</div></div>' +
+    '<div class="c"><div class="n">' + uso.sessoesComPeca + '</div><div class="l">visitas em que gerou alguma peça, de ' + uso.sessoes.length + '</div></div>' +
+    '</div>' +
+    '<h2>Aparelhos</h2><p class="mut" style="margin:-4px 0 10px">Cada celular ou computador ganha um nome na ordem em que apareceu. Os seus testes também entram aqui.</p><div class="tw"><table><tr><th>Aparelho</th><th>Primeiro uso</th><th>Último uso</th><th>Dias</th><th>Visitas</th><th>Peças</th></tr>' +
+    (uso.aparelhos.length ? uso.aparelhos.map(function (a) { return '<tr><td><b>' + esc(a.nome) + '</b></td><td>' + quando(a.primeiro) + '</td><td>' + quando(a.ultimo) + '</td><td>' + a.dias + '</td><td>' + a.sessoes + '</td><td>' + a.pecas + '</td></tr>'; }).join('') : '<tr><td colspan="6" class="mut">ninguém usou neste período</td></tr>') +
+    '</table></div>' +
+    '<h2>Registro de uso</h2><p class="mut" style="margin:-4px 0 10px">Cada linha é uma visita ao Studio, da mais recente para a mais antiga.</p><div class="log">' +
+    (uso.sessoes.length ? uso.sessoes.map(function (x) {
+      return '<div class="it' + (x.gerou ? '' : ' sem') + '"><div class="q"><b>' + quando(x.inicio) + '</b> · ' + esc(x.aparelho) + ' · ' + x.minutos + ' min</div><div>' + esc(x.resumo) +
+        (x.anuncios.length ? ' <span class="tag">' + x.anuncios.map(esc).join(', ') + '</span>' : '') + '</div>' +
+        (x.nErros ? '<div class="err">' + x.nErros + (x.nErros === 1 ? ' erro' : ' erros') + ': ' + x.erros.map(esc).join(' · ') + '</div>' : '') + '</div>';
+    }).join('') : '<div class="it sem">nenhuma visita neste período</div>') +
+    '</div>' +
+    '<h2>Números do período</h2>' +
+    '<div class="g">' +
     '<div class="c"><div class="n">' + m.aparelhos + '</div><div class="l">aparelhos diferentes (' + m.aparelhos7 + ' nos últimos 7 dias)</div></div>' +
     '<div class="c"><div class="n">' + m.sessoes + '</div><div class="l">sessões · ' + m.celular + ' no celular, ' + m.computador + ' no computador</div></div>' +
     '<div class="c"><div class="n">' + pecasTotal + '</div><div class="l">peças geradas · ' + m.gerar.foto + ' fotos, ' + m.gerar.video + ' vídeos, ' + m.gerar.montagem + ' montagens</div></div>' +
@@ -333,7 +489,7 @@ app.get('/painel', function (req, res) {
     '<h2>Por dia</h2><div class="tw"><table><tr><th>Dia</th><th>Aparelhos</th><th>Peças</th><th>Fotos com IA</th><th>Montagens</th></tr>' +
     m.porDia.slice().reverse().map(function (d) { return '<tr><td>' + d.dia.split('-').reverse().join('/') + '</td><td>' + d.aparelhos + '</td><td>' + d.pecas + '</td><td>' + d.fotoIA + '</td><td>' + d.montagens + '</td></tr>'; }).join('') +
     '</table></div><h2>Erros mais comuns</h2><div class="c">' + (m.erros.length ? m.erros.map(function (e) { return esc(e[0]) + ' — <b>' + e[1] + '</b>'; }).join('<br>') : '<span class="mut">nenhum erro registrado</span>') + '</div>' +
-    '<p class="mut" style="margin-top:28px">Dados anônimos: um código aleatório por aparelho, sem nome, telefone ou dados do imóvel. <a href="?token=' + esc(req.query.token) + '&dias=' + dias + '&formato=json">Baixar em JSON</a></p></div></body></html>';
+    '<p class="mut" style="margin-top:28px">Dados anônimos: um código aleatório por aparelho, sem nome, telefone ou dados do imóvel. <a href="/painel?dias=' + dias + '&formato=json">Baixar em JSON</a></p></div></body></html>';
   res.setHeader('Cache-Control', 'no-store');
   res.type('html').send(html);
 });
