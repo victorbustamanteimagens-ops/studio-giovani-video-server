@@ -1044,10 +1044,13 @@ app.post('/legenda', requireSiteOrigin, function (req, res, next) {
   }
   try {
     var dur = await probeDuration(src);
-    if (!dur) return fail(400, 'Não consegui ler esse vídeo.', 'video ilegivel');
-    if (dur > 15 * 60) return fail(400, 'O vídeo passou de 15 minutos. Corte em partes menores.', 'longo');
+    if (dur && dur > 15 * 60) return fail(400, 'O vídeo passou de 15 minutos. Corte em partes menores.', 'longo');
     var r = await runWithTimeout('ffmpeg', ['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', audioPath], 3 * 60 * 1000);
     var st = await fsp.stat(audioPath).catch(function () { return null; });
+    // Áudio gravado no navegador (webm) não traz a duração no cabeçalho: mede no mp3 já convertido.
+    if (!dur && r.code === 0 && st) dur = await probeDuration(audioPath);
+    if (!dur) return fail(400, 'Não consegui ler esse vídeo.', 'video ilegivel');
+    if (dur > 15 * 60) return fail(400, 'O vídeo passou de 15 minutos. Corte em partes menores.', 'longo');
     if (r.code !== 0 || !st || st.size < 2000) return fail(400, 'Esse vídeo não tem som, então não dá pra fazer a legenda.', 'sem audio');
     var data = await fsp.readFile(audioPath);
     var json = await callGemini('v1beta', GEMINI_TEXT_MODEL, {
